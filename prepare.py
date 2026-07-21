@@ -11,6 +11,7 @@ AUTORESEARCH_DATASET or by running this script with --dataset.
 """
 
 import argparse
+import json
 import math
 import os
 import pickle
@@ -30,13 +31,26 @@ import torch
 MAX_SEQ_LEN = 2048          # context length
 TIME_BUDGET = 300           # training time budget in seconds (5 minutes)
 EVAL_TOKENS = 40 * 524288   # number of tokens for validation eval
-VOCAB_SIZE = 8192
+VOCAB_SIZE = 16_384  # Half of nanochat's 32K default; leaves room for later SFT.
 
 # BPE split pattern (GPT-4 style, with \p{N}{1,2} instead of {1,3})
 SPLIT_PATTERN = r"""'(?i:[sdmt]|ll|ve|re)|[^\r\n\p{L}\p{N}]?+\p{L}+|\p{N}{1,2}| ?[^\s\p{L}\p{N}]++[\r\n]*|\s*[\r\n]|\s+(?!\S)|\s+"""
 
-SPECIAL_TOKENS = [f"<|reserved_{i}|>" for i in range(4)]
-BOS_TOKEN = "<|reserved_0|>"
+# Keep these names and ordering aligned with karpathy/nanochat. The conversation
+# delimiters are unused during pretraining, but make this tokenizer SFT-ready.
+SPECIAL_TOKENS = [
+    "<|bos|>",
+    "<|user_start|>",
+    "<|user_end|>",
+    "<|assistant_start|>",
+    "<|assistant_end|>",
+    "<|python_start|>",
+    "<|python_end|>",
+    "<|output_start|>",
+    "<|output_end|>",
+]
+BOS_TOKEN = "<|bos|>"
+TOKENIZER_FORMAT = "nanochat-rustbpe-v1"
 
 # ---------------------------------------------------------------------------
 # Dataset + cache configuration
@@ -286,10 +300,22 @@ def train_tokenizer(dataset_name=None):
     tokenizer_dir = _tokenizer_dir(dataset)
     tokenizer_pkl = os.path.join(tokenizer_dir, "tokenizer.pkl")
     token_bytes_path = os.path.join(tokenizer_dir, "token_bytes.pt")
+    tokenizer_config_path = os.path.join(tokenizer_dir, "tokenizer_config.json")
 
-    if os.path.exists(tokenizer_pkl) and os.path.exists(token_bytes_path):
-        print(f"Tokenizer: already trained at {tokenizer_dir}")
-        return
+    if all(os.path.exists(path) for path in (tokenizer_pkl, token_bytes_path, tokenizer_config_path)):
+        try:
+            with open(tokenizer_config_path, "r", encoding="utf-8") as f:
+                metadata = json.load(f)
+            if (
+                metadata.get("format") == TOKENIZER_FORMAT
+                and metadata.get("vocab_size") == VOCAB_SIZE
+                and metadata.get("special_tokens") == SPECIAL_TOKENS
+            ):
+                print(f"Tokenizer: already trained at {tokenizer_dir}")
+                return
+            print("Tokenizer: cached tokenizer is incompatible; rebuilding it.")
+        except (OSError, ValueError):
+            print("Tokenizer: cached metadata is unreadable; rebuilding it.")
 
     os.makedirs(tokenizer_dir, exist_ok=True)
 
@@ -321,6 +347,19 @@ def train_tokenizer(dataset_name=None):
 
     with open(tokenizer_pkl, "wb") as f:
         pickle.dump(enc, f)
+    with open(tokenizer_config_path, "w", encoding="utf-8") as f:
+        json.dump(
+            {
+                "format": TOKENIZER_FORMAT,
+                "vocab_size": enc.n_vocab,
+                "split_pattern": SPLIT_PATTERN,
+                "special_tokens": SPECIAL_TOKENS,
+                "bos_token": BOS_TOKEN,
+            },
+            f,
+            indent=2,
+            sort_keys=True,
+        )
 
     t1 = time.time()
     print(f"Tokenizer: trained in {t1 - t0:.1f}s, saved to {tokenizer_pkl}")
@@ -355,18 +394,35 @@ def train_tokenizer(dataset_name=None):
 class Tokenizer:
     """Minimal tokenizer wrapper. Training is handled above."""
 
-    def __init__(self, enc, dataset):
+    def __init__(self, enc, dataset, directory):
         self.enc = enc
         self.dataset = _resolve_dataset_name(dataset)
+        self.directory = directory
         self.bos_token_id = enc.encode_single_token(BOS_TOKEN)
 
     @classmethod
     def from_directory(cls, tokenizer_dir=None, dataset=None):
         dataset_name = _resolve_dataset_name(dataset)
         resolved_dir = tokenizer_dir if tokenizer_dir is not None else _tokenizer_dir(dataset_name)
+        metadata_path = os.path.join(resolved_dir, "tokenizer_config.json")
+        try:
+            with open(metadata_path, "r", encoding="utf-8") as f:
+                metadata = json.load(f)
+            is_compatible = (
+                metadata.get("format") == TOKENIZER_FORMAT
+                and metadata.get("vocab_size") == VOCAB_SIZE
+                and metadata.get("special_tokens") == SPECIAL_TOKENS
+            )
+        except (OSError, ValueError):
+            is_compatible = False
+        if not is_compatible:
+            raise RuntimeError(
+                f"Tokenizer at {resolved_dir} is not the required nanochat-compatible tokenizer. "
+                "Run `uv run prepare.py` to rebuild it."
+            )
         with open(os.path.join(resolved_dir, "tokenizer.pkl"), "rb") as f:
             enc = pickle.load(f)
-        return cls(enc, dataset=dataset_name)
+        return cls(enc, dataset=dataset_name, directory=resolved_dir)
 
     def get_vocab_size(self):
         return self.enc.n_vocab
@@ -374,18 +430,31 @@ class Tokenizer:
     def get_bos_token_id(self):
         return self.bos_token_id
 
-    def encode(self, text, prepend=None, num_threads=8):
+    def get_special_tokens(self):
+        return self.enc.special_tokens_set
+
+    def encode_special(self, text):
+        return self.enc.encode_single_token(text)
+
+    def encode(self, text, prepend=None, append=None, num_threads=8):
         if prepend is not None:
             prepend_id = prepend if isinstance(prepend, int) else self.enc.encode_single_token(prepend)
+        if append is not None:
+            append_id = append if isinstance(append, int) else self.enc.encode_single_token(append)
         if isinstance(text, str):
             ids = self.enc.encode_ordinary(text)
             if prepend is not None:
                 ids.insert(0, prepend_id)
+            if append is not None:
+                ids.append(append_id)
         elif isinstance(text, list):
             ids = self.enc.encode_ordinary_batch(text, num_threads=num_threads)
             if prepend is not None:
                 for row in ids:
                     row.insert(0, prepend_id)
+            if append is not None:
+                for row in ids:
+                    row.append(append_id)
         else:
             raise ValueError(f"Invalid input type: {type(text)}")
         return ids

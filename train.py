@@ -8,7 +8,30 @@ import argparse
 import gc
 import json
 import os
+
+# Load environment variables from .env if present
+try:
+    from dotenv import load_dotenv
+    load_dotenv()
+except ImportError:
+    # Simple fallback parser for .env files (key=value per line, ignoring comments)
+                env_path = os.path.join(os.path.dirname(__file__), ".env")
+                if os.path.isfile(env_path):
+                    with open(env_path, "r", encoding="utf-8") as f:
+                        for line in f:
+                            line = line.strip()
+                            if not line or line.startswith("#"):
+                                continue
+                            if "=" in line:
+                                key, val = line.split("=", 1)
+                                # Strip surrounding quotes if present
+                                val = val.strip().strip('"').strip("'")
+                                os.environ.setdefault(key.strip(), val)
+
+
 import platform
+import shutil
+import tempfile
 import time
 from dataclasses import asdict, dataclass
 from pathlib import Path
@@ -1050,7 +1073,67 @@ def _configure_step_kernels(runtime):
     USE_COMPILE = False
 
 
-def _run_training_once(runtime, tokenizer, config, device_batch_size, smoke_test):
+class ExperimentTracker:
+    """Best-effort W&B integration that never makes an experiment depend on W&B."""
+
+    def __init__(self, args, config, runtime, tokenizer):
+        self.run = None
+        self.run_url = None
+        api_key = os.environ.get("WANDB_API_KEY")
+        if not api_key:
+            print("W&B: disabled (set WANDB_API_KEY to enable logging).")
+            return
+        try:
+            import wandb
+            run_config = {
+                "model": _serializable_config(config),
+                "dataset": tokenizer.dataset,
+                "vocab_size": tokenizer.get_vocab_size(),
+                "gpu": runtime.gpu_name,
+                "gpu_vram_gb": runtime.gpu_vram_gb,
+                "time_budget_seconds": TIME_BUDGET,
+            }
+            wandb.login(key=api_key, relogin=True)
+            self.run = wandb.init(
+                project=args.wandb_project or os.environ.get("WANDB_PROJECT", "autoresearch"),
+                entity=os.environ.get("WANDB_ENTITY"),
+                name=args.wandb_run_name or os.environ.get("WANDB_RUN_NAME"),
+                config=run_config,
+            )
+            # Store run URL for later inclusion in HF README
+            self.run_url = getattr(self.run, "url", None)
+            print(f"W&B: logging to run {self.run.name}")
+        except Exception as exc:  # Network telemetry must never fail training.
+            print(f"Warning: W&B disabled after initialization failure: {exc}")
+
+    def log(self, metrics, step=None):
+        if self.run is not None:
+            try:
+                self.run.log(metrics, step=step)
+            except Exception as exc:
+                print(f"Warning: W&B logging disabled after failure: {exc}")
+                self.run = None
+
+    def finish(self, metrics=None):
+        if self.run is not None:
+            try:
+                if metrics:
+                    self.run.log(metrics)
+                self.run.finish()
+            except Exception as exc:
+                print(f"Warning: W&B finalization failed: {exc}")
+            finally:
+                self.run = None
+
+
+def _serializable_config(config):
+    return {
+        key: str(value) if isinstance(value, torch.dtype) else value
+        for key, value in asdict(config).items()
+    }
+
+
+def _run_training_once(runtime, tokenizer, config, device_batch_size, smoke_test, tracker=None):
     t_start = time.time()
     torch.manual_seed(42)
     torch.cuda.manual_seed(42)
@@ -1170,6 +1253,19 @@ def _run_training_once(runtime, tokenizer, config, device_batch_size, smoke_test
             end="",
             flush=True,
         )
+        if tracker is not None:
+            tracker.log(
+                {
+                    "train/loss": train_loss_f,
+                    "train/smoothed_loss": debiased_smooth_loss,
+                    "train/lr_multiplier": lrm,
+                    "train/tok_per_sec": tok_per_sec,
+                    "train/epoch": epoch,
+                    "train/training_seconds": total_training_time,
+                    "train/mfu_percent": mfu if runtime.gpu_peak_flops else None,
+                },
+                step=step,
+            )
 
         if step == 0:
             gc.collect()
@@ -1198,6 +1294,71 @@ def _run_training_once(runtime, tokenizer, config, device_batch_size, smoke_test
     }
 
 
+def _upload_to_huggingface(args, model, tokenizer, config, metrics, wandb_url=None, run_name=None):
+    """Upload a self-contained checkpoint bundle when both HF credentials and a repo are configured."""
+    token = os.environ.get("HF_TOKEN") or os.environ.get("HUGGINGFACE_HUB_TOKEN")
+    if not token:
+        print("Hugging Face: disabled (set HF_TOKEN or HUGGINGFACE_HUB_TOKEN to enable uploads).")
+        return
+    # Resolve the authenticated user namespace (no org needed)
+    from huggingface_hub import HfApi
+    user = HfApi(token=token).whoami()["name"]
+    # Determine repository name: use provided WandB run name if available, otherwise generate a unique name
+    repo_name = run_name or f"autoresearch-{int(time.time())}"
+    repo_id = f"{user}/{repo_name}"
+    if not token:
+        print("Hugging Face: disabled (set HF_TOKEN or HUGGINGFACE_HUB_TOKEN to enable uploads).")
+        return
+    if not repo_id:
+        print("Warning: Hugging Face token found but no repository configured; set HF_REPO_ID or --hf-repo-id.")
+        return
+
+    try:
+        from huggingface_hub import HfApi
+        with tempfile.TemporaryDirectory(prefix="autoresearch-hf-") as export_dir:
+            state_dict = model._orig_mod.state_dict() if hasattr(model, "_orig_mod") else model.state_dict()
+            torch.save(
+                {
+                    "state_dict": state_dict,
+                    "model_config": _serializable_config(config),
+                    "metrics": metrics,
+                },
+                os.path.join(export_dir, "model.pt"),
+            )
+            with open(os.path.join(export_dir, "config.json"), "w", encoding="utf-8") as f:
+                json.dump(_serializable_config(config), f, indent=2, sort_keys=True)
+            with open(os.path.join(export_dir, "training_metrics.json"), "w", encoding="utf-8") as f:
+                json.dump(metrics, f, indent=2, sort_keys=True)
+            for filename in ("tokenizer.pkl", "tokenizer_config.json", "token_bytes.pt", "dataset.txt"):
+                source = os.path.join(tokenizer.directory, filename)
+                if os.path.exists(source):
+                    shutil.copy2(source, os.path.join(export_dir, filename))
+            with open(os.path.join(export_dir, "README.md"), "w", encoding="utf-8") as f:
+                readme = (
+                    "---\n"
+                    "library_name: autoresearch\n"
+                    "tags:\n- autoresearch\n- nanochat-tokenizer\n"
+                    "---\n\n"
+                    "# autoresearch experiment\n\n"
+                    "This checkpoint uses the 16,384-token nanochat-compatible BPE tokenizer. "
+                    "Load `model.pt` with this repository's `GPT` class and `config.json`.\n"
+                )
+                if wandb_url:
+                    readme += f"\nW\u0026B run URL: {wandb_url}\n"
+                f.write(readme)
+            api = HfApi(token=token)
+            api.create_repo(repo_id=repo_id, repo_type="model", private=args.hf_private, exist_ok=True)
+            api.upload_folder(
+                repo_id=repo_id,
+                repo_type="model",
+                folder_path=export_dir,
+                commit_message=f"Upload autoresearch experiment (val_bpb={metrics['val_bpb']:.6f})",
+            )
+        print(f"Hugging Face: uploaded model and tokenizer to {repo_id}")
+    except Exception as exc:  # Upload failure should not erase a completed local experiment.
+        print(f"Warning: Hugging Face upload failed: {exc}")
+
+
 def _save_pre_eval_checkpoint(model):
     try:
         state_dict = model._orig_mod.state_dict() if hasattr(model, "_orig_mod") else model.state_dict()
@@ -1218,6 +1379,10 @@ def main():
     parser = argparse.ArgumentParser(description="Autoresearch training script")
     parser.add_argument("--smoke-test", action="store_true", help="Run a short train/eval pass for validation.")
     parser.add_argument("--dataset", choices=DATASET_CHOICES, default=None, help="Optional dataset override.")
+    parser.add_argument("--wandb-project", default=None, help="W&B project (requires WANDB_API_KEY).")
+    parser.add_argument("--wandb-run-name", default=None, help="Optional W&B run name.")
+    parser.add_argument("--hf-repo-id", default=None, help="Hugging Face model repo (requires HF_TOKEN).")
+    parser.add_argument("--hf-private", action="store_true", help="Create the Hugging Face repository as private if needed.")
     args = parser.parse_args()
 
     runtime = detect_runtime()
@@ -1247,6 +1412,8 @@ def main():
     result = None
     chosen_train_batch = None
     chosen_checkpointing = None
+    tracker = None
+    selected_config = None
     for train_batch_size, use_checkpointing in train_candidates:
         config = build_model_config(
             DEPTH,
@@ -1261,15 +1428,18 @@ def main():
         )
         print(f"Model config: {asdict(config)}")
         try:
+            tracker = ExperimentTracker(args, config, runtime, tokenizer)
             result = _run_training_once(
                 runtime=runtime,
                 tokenizer=tokenizer,
                 config=config,
                 device_batch_size=train_batch_size,
                 smoke_test=args.smoke_test,
+                tracker=tracker,
             )
             chosen_train_batch = train_batch_size
             chosen_checkpointing = use_checkpointing
+            selected_config = config
             break
         except torch.cuda.OutOfMemoryError:
             print(
@@ -1277,9 +1447,13 @@ def main():
                 f"batch_size={train_batch_size}, checkpointing={'on' if use_checkpointing else 'off'}; "
                 "trying next candidate."
             )
+            if tracker is not None:
+                tracker.finish({"status": "oom"})
             torch.cuda.empty_cache()
             _restore_gc_after_attempt()
         except RuntimeError as exc:
+            if tracker is not None:
+                tracker.finish({"status": "failed", "error": str(exc)})
             _restore_gc_after_attempt()
             print(str(exc))
             return 1
@@ -1339,6 +1513,22 @@ def main():
         steady_state_mfu = None
     peak_vram_mb = torch.cuda.max_memory_allocated() / 1024 / 1024
     total_tokens = step * TOTAL_BATCH_SIZE
+    experiment_metrics = {
+        "val_bpb": val_bpb,
+        "training_seconds": total_training_time,
+        "total_seconds": t_end - result["t_start"],
+        "peak_vram_mb": peak_vram_mb,
+        "mfu_percent": steady_state_mfu,
+        "total_tokens": total_tokens,
+        "num_steps": step,
+        "num_params": num_params,
+        "depth": DEPTH,
+        "dataset": tokenizer.dataset,
+        "train_batch_size": chosen_train_batch,
+        "eval_batch_size": chosen_eval_batch,
+        "activation_checkpointing": chosen_checkpointing,
+        "smoke_test": args.smoke_test,
+    }
 
     print("---")
     print(f"val_bpb:          {val_bpb:.6f}")
@@ -1359,6 +1549,12 @@ def main():
     print(f"activation_checkpointing: {'enabled' if chosen_checkpointing else 'disabled'}")
     if args.smoke_test:
         print("smoke_test:       true")
+    run_name = None
+    if tracker is not None and getattr(tracker, "run", None) is not None:
+        run_name = tracker.run.name
+    if tracker is not None:
+        tracker.finish({"val_bpb": val_bpb, "eval/batch_size": chosen_eval_batch, "status": "completed"})
+    _upload_to_huggingface(args, model, tokenizer, selected_config, experiment_metrics, tracker.run_url if tracker is not None else None, run_name)
     return 0
 
 
