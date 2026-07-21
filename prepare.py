@@ -29,9 +29,9 @@ import torch
 # ---------------------------------------------------------------------------
 
 MAX_SEQ_LEN = 2048          # context length
-TIME_BUDGET = 300           # training time budget in seconds (5 minutes)
+TIME_BUDGET = 600           # training time budget in seconds (5 minutes)
 EVAL_TOKENS = 40 * 524288   # number of tokens for validation eval
-VOCAB_SIZE = 16_384  # Half of nanochat's 32K default; leaves room for later SFT.
+VOCAB_SIZE = 16_384  # Half of nanochat's 32K default; 
 
 # BPE split pattern (GPT-4 style, with \p{N}{1,2} instead of {1,3})
 SPLIT_PATTERN = r"""'(?i:[sdmt]|ll|ve|re)|[^\r\n\p{L}\p{N}]?+\p{L}+|\p{N}{1,2}| ?[^\s\p{L}\p{N}]++[\r\n]*|\s*[\r\n]|\s+(?!\S)|\s+"""
