@@ -103,7 +103,7 @@ VRAM_FLOOR_TOLERANCE_GB = 0.05
 AUTOTUNE_WARMUP_STEPS = 2
 AUTOTUNE_MEASURE_STEPS = 3
 AUTOTUNE_MAX_MEMORY_FRACTION = 0.90
-AUTOTUNE_CACHE_VERSION = "gpu-profile-v2"
+AUTOTUNE_CACHE_VERSION = "gpu-profile-v3"
 
 
 def _get_gpu_peak_flops(gpu_name):
@@ -174,7 +174,7 @@ def _resolve_gpu_profile(gpu_name, capability, gpu_vram_gb, is_windows):
                 name=mid_tier_name,
                 is_supported_consumer=True,
                 is_compatibility_only=False,
-                train_batch_candidates=(16, 8, 4),
+                train_batch_candidates=(4),
                 checkpoint_modes=(True,),
                 default_checkpointing=True,
             )
@@ -836,7 +836,7 @@ WARMDOWN_RATIO = 0.5
 FINAL_LR_FRAC = 0.0
 
 # Model size + memory defaults
-DEPTH = 8
+DEPTH = 12
 DEVICE_BATCH_SIZE = 16
 EVAL_BATCH_SIZE = 8
 
@@ -1493,6 +1493,44 @@ def main():
     if val_bpb is None:
         print("FAIL: eval failed for all batch sizes.")
         return 1
+
+    # --- Inference: generate text from seed sentences ---
+    print("\n--- Inference ---")
+    seed_sentences = [
+        "Once upon a time, ",
+        "A lonely dragon ",
+        "The opposite of boy is ",
+        "The opposite of queen is ",
+        "My name is ",
+    ]
+    max_new_tokens = 50
+    temperature = 0.8
+    top_p = 0.95
+
+    model.eval()
+    with torch.no_grad():
+        for seed in seed_sentences:
+            input_ids = tokenizer.encode(seed)
+            generated = list(input_ids)
+            x = torch.tensor([generated], dtype=torch.long, device=runtime.device)
+            for _ in range(max_new_tokens):
+                cos_sin = (model.cos[:, :x.size(1)], model.sin[:, :x.size(1)])
+                logits = model(x)
+                logits = logits[:, -1, :] / temperature
+                sorted_logits, sorted_indices = torch.sort(logits, descending=True)
+                cumulative_probs = torch.cumsum(torch.softmax(sorted_logits, dim=-1), dim=-1)
+                sorted_indices_to_remove = cumulative_probs > top_p
+                sorted_indices_to_remove[..., 1:] = sorted_indices_to_remove[..., :-1].clone()
+                sorted_indices_to_remove[..., 0] = 0
+                indices_to_remove = sorted_indices_to_remove.scatter(1, sorted_indices, sorted_indices_to_remove)
+                logits[indices_to_remove] = float('-inf')
+                probs = torch.softmax(logits, dim=-1)
+                next_token = torch.multinomial(probs, num_samples=1)
+                generated.append(next_token.item())
+                x = torch.tensor([generated], dtype=torch.long, device=runtime.device)
+            print(f"Prompt: {repr(seed)}")
+            print(f"Output: {tokenizer.decode(generated)}")
+            print()
 
     t_end = time.time()
     step = result["step"]

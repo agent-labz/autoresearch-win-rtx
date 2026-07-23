@@ -29,7 +29,7 @@ import torch
 # ---------------------------------------------------------------------------
 
 MAX_SEQ_LEN = 2048          # context length
-TIME_BUDGET = 600           # training time budget in seconds (5 minutes)
+TIME_BUDGET = 3600           # training time budget in seconds (5 minutes)
 EVAL_TOKENS = 40 * 524288   # number of tokens for validation eval
 VOCAB_SIZE = 16_384  # Half of nanochat's 32K default; 
 
