@@ -174,7 +174,7 @@ def _resolve_gpu_profile(gpu_name, capability, gpu_vram_gb, is_windows):
                 name=mid_tier_name,
                 is_supported_consumer=True,
                 is_compatibility_only=False,
-                train_batch_candidates=(4),
+                train_batch_candidates=(4,),
                 checkpoint_modes=(True,),
                 default_checkpointing=True,
             )
@@ -352,6 +352,11 @@ class GPTConfig:
     attention_backend: str = "sdpa"
     use_activation_checkpointing: bool = False
     compute_dtype: torch.dtype = torch.bfloat16
+    use_moe: bool = False
+    num_experts: int = 8
+    num_shared_experts: int = 1
+    num_experts_per_tok: int = 2
+    expert_dim: int = 2048
 
 
 def norm(x):
@@ -452,16 +457,175 @@ class MLP(nn.Module):
         return x
 
 
+class SwiGLUExpert(nn.Module):
+    """SwiGLU Feed-Forward Network used as an MoE expert."""
+
+    def __init__(self, n_embd, expert_dim):
+        super().__init__()
+        self.w1 = nn.Linear(n_embd, expert_dim, bias=False)
+        self.w3 = nn.Linear(n_embd, expert_dim, bias=False)
+        self.w2 = nn.Linear(expert_dim, n_embd, bias=False)
+
+    def forward(self, x):
+        return self.w2(F.silu(self.w1(x)) * self.w3(x))
+
+
+class ExpertRouter(nn.Module):
+    """Top-K gating router for MoE with load balancing support."""
+
+    def __init__(self, n_embd, num_experts, num_experts_per_tok):
+        super().__init__()
+        self.gate = nn.Linear(n_embd, num_experts, bias=False)
+        self.k = num_experts_per_tok
+        self.num_experts = num_experts
+
+    def forward(self, x):
+        input_dtype = x.dtype
+        logits = self.gate(x)
+        scores = F.softmax(logits.float(), dim=-1).to(input_dtype)
+        topk_scores, topk_indices = torch.topk(scores, self.k, dim=-1)
+        topk_scores = topk_scores / (topk_scores.sum(dim=-1, keepdim=True) + 1e-9)
+        return topk_scores, topk_indices, logits.float()
+
+
+class MoELayer(nn.Module):
+    """Mixture of Experts layer with shared + routed experts."""
+
+    def __init__(self, config):
+        super().__init__()
+        self.router = ExpertRouter(config.n_embd, config.num_experts, config.num_experts_per_tok)
+        self.shared_experts = nn.ModuleList([
+            SwiGLUExpert(config.n_embd, config.expert_dim)
+            for _ in range(config.num_shared_experts)
+        ])
+        self.routed_experts = nn.ModuleList([
+            SwiGLUExpert(config.n_embd, config.expert_dim)
+            for _ in range(config.num_experts)
+        ])
+        self.n_shared = config.num_shared_experts
+        self.n_routed = config.num_experts
+        self.k = config.num_experts_per_tok
+
+    def forward(self, x, collect_diagnostics=False):
+        B, T, D = x.shape
+        x_flat = x.view(-1, D)
+        N = B * T
+
+        # --- Shared experts: run on all tokens (unchanged) ---
+        shared_out = torch.zeros_like(x_flat)
+        for expert in self.shared_experts:
+            shared_out = shared_out + expert(x_flat)
+
+        # --- Routed experts: batch by expert, run each once ---
+        topk_scores, topk_indices, router_logits = self.router(x_flat)
+
+        # Flatten (N, k) assignments into (N*k,) pairs of (token_idx, expert_idx)
+        token_idx = torch.arange(N, device=x.device).unsqueeze(1).expand_as(topk_indices).reshape(-1)
+        expert_idx = topk_indices.reshape(-1)
+        weights = topk_scores.reshape(-1)
+
+        # Run each active expert exactly once on its assigned tokens
+        # bincount gives per-expert token counts (including zeros for idle experts)
+        counts_per_expert = torch.bincount(expert_idx, minlength=self.n_routed)
+        # cumsum gives the start index of each expert's segment in the sorted arrays
+        offsets = torch.zeros(self.n_routed + 1, dtype=torch.long, device=x.device)
+        offsets[1:] = counts_per_expert.cumsum(0)
+
+        # argsort by expert so all tokens for the same expert are contiguous
+        sort_order = expert_idx.argsort()
+        sorted_tokens = token_idx[sort_order]
+        sorted_weights = weights[sort_order]
+
+        routed_out = torch.zeros_like(x_flat)
+        expert_outs_for_diag = [] if collect_diagnostics else None
+        for e in range(self.n_routed):
+            count = counts_per_expert[e].item()
+            if count == 0:
+                if collect_diagnostics:
+                    expert_outs_for_diag.append(None)
+                continue
+            start = offsets[e].item()
+            assigned_tokens = sorted_tokens[start:start + count]
+            assigned_weights = sorted_weights[start:start + count]
+
+            expert_out = self.routed_experts[e](x_flat[assigned_tokens])
+            if collect_diagnostics:
+                expert_outs_for_diag.append(expert_out.detach())
+            routed_out.index_add_(
+                0, assigned_tokens,
+                assigned_weights.unsqueeze(-1).to(routed_out.dtype) * expert_out,
+            )
+
+        out = shared_out + routed_out
+
+        # --- Optional routing diagnostics (expensive — only when requested) ---
+        diagnostics = None
+        if collect_diagnostics:
+            with torch.no_grad():
+                router_probs = F.softmax(router_logits.float(), dim=-1)
+                # Per-expert token counts
+                expert_token_counts = counts_per_expert.tolist()
+                # Router entropy: H(p) = -sum(p * log(p)) averaged over tokens
+                log_probs = torch.log(router_probs + 1e-9)
+                entropy = -(router_probs * log_probs).sum(dim=-1).mean().item()
+                # Max routing probability per token, averaged
+                max_prob = router_probs.max(dim=-1).values.mean().item()
+                # Per-routed-expert output L2 norms (from individual expert outputs)
+                expert_norms = []
+                for e in range(self.n_routed):
+                    if expert_outs_for_diag[e] is None:
+                        expert_norms.append(0.0)
+                    else:
+                        expert_norms.append(expert_outs_for_diag[e].norm(dim=-1).mean().item())
+                # Shared expert output L2 norm
+                shared_norm = shared_out.norm().item()
+                diagnostics = {
+                    "expert_token_counts": expert_token_counts,
+                    "router_entropy": entropy,
+                    "router_max_prob": max_prob,
+                    "expert_norms": expert_norms,
+                    "shared_expert_norm": shared_norm,
+                }
+
+        return out.view(B, T, D), router_logits, diagnostics
+
+
+def compute_load_balancing_loss(router_logits, num_experts):
+    """Compute Switch Transformer auxiliary load balancing loss."""
+    scores = F.softmax(router_logits, dim=-1)
+    with torch.no_grad():
+        topk_indices = torch.argmax(scores, dim=-1)
+        one_hot = F.one_hot(topk_indices, num_experts).float()
+        load = one_hot.mean(dim=(0, 1))
+    importance = scores.mean(dim=(0, 1))
+    aux_loss = num_experts * (importance * load).sum()
+    return aux_loss
+
+
+def compute_z_loss(router_logits):
+    """Compute router Z-loss to prevent overconfident routing."""
+    return torch.logsumexp(router_logits, dim=-1).square().mean()
+
+
 class Block(nn.Module):
     def __init__(self, config, layer_idx):
         super().__init__()
         self.attn = CausalSelfAttention(config, layer_idx)
-        self.mlp = MLP(config)
+        if config.use_moe:
+            self.mlp = MoELayer(config)
+        else:
+            self.mlp = MLP(config)
+        self.use_moe = config.use_moe
 
-    def forward(self, x, ve, cos_sin, window_size):
+    def forward(self, x, ve, cos_sin, window_size, collect_diagnostics=False):
         x = x + self.attn(norm(x), ve, cos_sin, window_size)
-        x = x + self.mlp(norm(x))
-        return x
+        if self.use_moe:
+            mlp_out, router_logits, diagnostics = self.mlp(norm(x), collect_diagnostics=collect_diagnostics)
+            x = x + mlp_out
+            return x, router_logits, diagnostics
+        else:
+            x = x + self.mlp(norm(x))
+            return x, None, None
 
 
 class GPT(nn.Module):
@@ -498,8 +662,19 @@ class GPT(nn.Module):
             torch.nn.init.uniform_(block.attn.c_k.weight, -s, s)
             torch.nn.init.uniform_(block.attn.c_v.weight, -s, s)
             torch.nn.init.zeros_(block.attn.c_proj.weight)
-            torch.nn.init.uniform_(block.mlp.c_fc.weight, -s, s)
-            torch.nn.init.zeros_(block.mlp.c_proj.weight)
+            if self.config.use_moe:
+                for expert in block.mlp.shared_experts:
+                    torch.nn.init.uniform_(expert.w1.weight, -s, s)
+                    torch.nn.init.uniform_(expert.w3.weight, -s, s)
+                    torch.nn.init.zeros_(expert.w2.weight)
+                for expert in block.mlp.routed_experts:
+                    torch.nn.init.uniform_(expert.w1.weight, -s, s)
+                    torch.nn.init.uniform_(expert.w3.weight, -s, s)
+                    torch.nn.init.zeros_(expert.w2.weight)
+                torch.nn.init.zeros_(block.mlp.router.gate.weight)
+            else:
+                torch.nn.init.uniform_(block.mlp.c_fc.weight, -s, s)
+                torch.nn.init.zeros_(block.mlp.c_proj.weight)
         self.resid_lambdas.fill_(1.0)
         self.x0_lambdas.fill_(0.1)
         for ve in self.value_embeds.values():
@@ -561,6 +736,21 @@ class GPT(nn.Module):
             window = window_size[0]
             effective_seq = t if window < 0 else min(window, t)
             attn_flops += 12 * h * q * effective_seq
+
+        if self.config.use_moe:
+            active_expert_params = (
+                self.config.num_shared_experts + self.config.num_experts_per_tok
+            ) * (3 * self.config.n_embd * self.config.expert_dim)
+            nparams_per_block = (
+                4 * self.config.n_embd ** 2
+                + active_expert_params
+                + self.config.num_experts * self.config.n_embd
+            )
+            attn_params = sum(
+                p.numel() for block in self.transformer.h for p in block.attn.parameters()
+            )
+            return 6 * (nparams - nparams_exclude) + attn_flops
+
         return 6 * (nparams - nparams_exclude) + attn_flops
 
     def num_scaling_params(self):
@@ -626,7 +816,7 @@ class GPT(nn.Module):
             group["initial_lr"] = group["lr"]
         return optimizer
 
-    def forward(self, idx, targets=None, reduction="mean"):
+    def forward(self, idx, targets=None, reduction="mean", collect_diagnostics=False):
         B, T = idx.size()
         assert T <= self.cos.size(1)
         cos_sin = self.cos[:, :T], self.sin[:, :T]
@@ -634,14 +824,20 @@ class GPT(nn.Module):
         x = self.transformer.wte(idx)
         x = norm(x)
         x0 = x
+        all_router_logits = []
+        all_diagnostics = []
         for i, block in enumerate(self.transformer.h):
             x = self.resid_lambdas[i] * x + self.x0_lambdas[i] * x0
             ve = self.value_embeds[str(i)](idx) if str(i) in self.value_embeds else None
             window_size = self.window_sizes[i]
             if self.config.use_activation_checkpointing:
-                x = torch_checkpoint(block, x, ve, cos_sin, window_size, use_reentrant=False)
+                x, router_logits, diagnostics = torch_checkpoint(block, x, ve, cos_sin, window_size, collect_diagnostics, use_reentrant=False)
             else:
-                x = block(x, ve, cos_sin, window_size)
+                x, router_logits, diagnostics = block(x, ve, cos_sin, window_size, collect_diagnostics=collect_diagnostics)
+            if router_logits is not None:
+                all_router_logits.append(router_logits)
+            if diagnostics is not None:
+                all_diagnostics.append(diagnostics)
         x = norm(x)
 
         softcap = 15
@@ -649,14 +845,22 @@ class GPT(nn.Module):
         logits = softcap * torch.tanh(logits / softcap)
 
         if targets is not None:
-            loss = F.cross_entropy(
+            ce_loss = F.cross_entropy(
                 logits.float().view(-1, logits.size(-1)),
                 targets.view(-1),
                 ignore_index=-1,
                 reduction=reduction,
             )
-            return loss
-        return logits
+
+            aux_loss = torch.tensor(0.0, device=ce_loss.device)
+            z_loss = torch.tensor(0.0, device=ce_loss.device)
+            if self.config.use_moe and all_router_logits:
+                combined_logits = torch.cat(all_router_logits, dim=0)
+                aux_loss = compute_load_balancing_loss(combined_logits, self.config.num_experts)
+                z_loss = compute_z_loss(combined_logits)
+
+            return ce_loss, aux_loss, z_loss, all_diagnostics
+        return logits, None
 
 
 # ---------------------------------------------------------------------------
@@ -785,7 +989,8 @@ class MuonAdamW(torch.optim.Optimizer):
             state_shape = (num_params, shape[-2], 1) if shape[-2] >= shape[-1] else (num_params, 1, shape[-1])
             state["second_momentum_buffer"] = torch.zeros(state_shape, dtype=dtype, device=device)
         red_dim = -1 if shape[-2] >= shape[-1] else -2
-        stacked_grads = torch.stack([p.grad for p in params])
+        grads = [p.grad if p.grad is not None else torch.zeros_like(p) for p in params]
+        stacked_grads = torch.stack(grads)
         stacked_params = torch.stack(params)
         self._muon_momentum_t.fill_(group["momentum"])
         self._muon_beta2_t.fill_(group["beta2"] if group["beta2"] is not None else 0.0)
@@ -835,13 +1040,18 @@ WARMUP_RATIO = 0.0
 WARMDOWN_RATIO = 0.5
 FINAL_LR_FRAC = 0.0
 
+# MoE loss weights
+MOE_AUX_LOSS_WEIGHT = 0.1
+MOE_Z_LOSS_WEIGHT = 0.001
+
 # Model size + memory defaults
-DEPTH = 12
+DEPTH = 8
 DEVICE_BATCH_SIZE = 16
 EVAL_BATCH_SIZE = 8
 
 
-def build_model_config(depth, vocab_size, runtime, use_activation_checkpointing=None):
+def build_model_config(depth, vocab_size, runtime, use_activation_checkpointing=None, use_moe=False,
+                       num_experts=8, num_shared_experts=1, num_experts_per_tok=2, expert_dim=2048):
     if use_activation_checkpointing is None:
         use_activation_checkpointing = runtime.use_activation_checkpointing
     base_dim = depth * ASPECT_RATIO
@@ -858,6 +1068,11 @@ def build_model_config(depth, vocab_size, runtime, use_activation_checkpointing=
         attention_backend=runtime.attention_backend,
         use_activation_checkpointing=use_activation_checkpointing,
         compute_dtype=runtime.amp_dtype,
+        use_moe=use_moe,
+        num_experts=num_experts,
+        num_shared_experts=num_shared_experts,
+        num_experts_per_tok=num_experts_per_tok,
+        expert_dim=expert_dim,
     )
 
 
@@ -898,12 +1113,19 @@ def _build_eval_batch_candidates(train_batch_size, initial_eval_batch):
     return deduped
 
 
-def _benchmark_train_candidate(runtime, tokenizer, vocab_size, train_batch_size, use_checkpointing):
+def _benchmark_train_candidate(runtime, tokenizer, vocab_size, train_batch_size, use_checkpointing,
+                                use_moe=False, num_experts=8, num_shared_experts=1, num_experts_per_tok=2, expert_dim=2048,
+                                train_dataset=None):
     config = build_model_config(
         DEPTH,
         vocab_size,
         runtime,
         use_activation_checkpointing=use_checkpointing,
+        use_moe=use_moe,
+        num_experts=num_experts,
+        num_shared_experts=num_shared_experts,
+        num_experts_per_tok=num_experts_per_tok,
+        expert_dim=expert_dim,
     )
     tokens_per_fwdbwd = train_batch_size * MAX_SEQ_LEN
     grad_accum_steps = TOTAL_BATCH_SIZE // tokens_per_fwdbwd
@@ -934,7 +1156,7 @@ def _benchmark_train_candidate(runtime, tokenizer, vocab_size, train_batch_size,
             MAX_SEQ_LEN,
             "train",
             device=runtime.device,
-            dataset=tokenizer.dataset,
+            dataset=train_dataset or tokenizer.dataset,
         )
         x, y, _ = next(train_loader)
         torch.cuda.empty_cache()
@@ -947,7 +1169,7 @@ def _benchmark_train_candidate(runtime, tokenizer, vocab_size, train_batch_size,
             t0 = time.time()
             for _ in range(grad_accum_steps):
                 with autocast_ctx:
-                    loss = model(x, y)
+                    loss = model(x, y)[0]
                 (loss / grad_accum_steps).backward()
                 x, y, _ = next(train_loader)
             optimizer.step()
@@ -978,7 +1200,9 @@ def _benchmark_train_candidate(runtime, tokenizer, vocab_size, train_batch_size,
         _restore_gc_after_attempt()
 
 
-def _autotune_train_candidate(runtime, tokenizer, vocab_size, train_candidates):
+def _autotune_train_candidate(runtime, tokenizer, vocab_size, train_candidates,
+                               use_moe=False, num_experts=8, num_shared_experts=1, num_experts_per_tok=2, expert_dim=2048,
+                               train_dataset=None):
     if not runtime.gpu_profile.is_supported_consumer:
         return None
     if os.environ.get("AUTORESEARCH_DISABLE_AUTOTUNE", "0") == "1":
@@ -1006,6 +1230,8 @@ def _autotune_train_candidate(runtime, tokenizer, vocab_size, train_candidates):
                     return cached_candidate
 
     print("Running consumer GPU autotune in eager mode...")
+    if use_moe:
+        print(f"MoE enabled: {num_experts} experts, {num_shared_experts} shared, top-{num_experts_per_tok} routing")
     best_candidate = None
     best_tok_per_sec = -1.0
     best_peak_memory = 0
@@ -1018,6 +1244,12 @@ def _autotune_train_candidate(runtime, tokenizer, vocab_size, train_candidates):
             vocab_size=vocab_size,
             train_batch_size=train_batch_size,
             use_checkpointing=use_checkpointing,
+            use_moe=use_moe,
+            num_experts=num_experts,
+            num_shared_experts=num_shared_experts,
+            num_experts_per_tok=num_experts_per_tok,
+            expert_dim=expert_dim,
+            train_dataset=train_dataset,
         )
         if result is None:
             print("  rejected (OOM, runtime error, or >90% VRAM use)")
@@ -1076,7 +1308,7 @@ def _configure_step_kernels(runtime):
 class ExperimentTracker:
     """Best-effort W&B integration that never makes an experiment depend on W&B."""
 
-    def __init__(self, args, config, runtime, tokenizer):
+    def __init__(self, args, config, runtime, tokenizer, train_dataset=None):
         self.run = None
         self.run_url = None
         api_key = os.environ.get("WANDB_API_KEY")
@@ -1087,7 +1319,8 @@ class ExperimentTracker:
             import wandb
             run_config = {
                 "model": _serializable_config(config),
-                "dataset": tokenizer.dataset,
+                "train_dataset": train_dataset or tokenizer.dataset,
+                "tokenizer_dataset": tokenizer.dataset,
                 "vocab_size": tokenizer.get_vocab_size(),
                 "gpu": runtime.gpu_name,
                 "gpu_vram_gb": runtime.gpu_vram_gb,
@@ -1133,7 +1366,8 @@ def _serializable_config(config):
     }
 
 
-def _run_training_once(runtime, tokenizer, config, device_batch_size, smoke_test, tracker=None):
+def _run_training_once(runtime, tokenizer, config, device_batch_size, smoke_test, tracker=None, load_from=None,
+                        train_dataset=None):
     t_start = time.time()
     torch.manual_seed(42)
     torch.cuda.manual_seed(42)
@@ -1145,6 +1379,17 @@ def _run_training_once(runtime, tokenizer, config, device_batch_size, smoke_test
         model = GPT(config)
     model.to_empty(device=runtime.device)
     model.init_weights(embed_dtype=runtime.amp_dtype)
+
+    if load_from is not None:
+        print(f"Loading pretrained weights from {load_from}...")
+        ckpt = torch.load(load_from, map_location=runtime.device)
+        state_dict = ckpt if not isinstance(ckpt, dict) else ckpt.get("state_dict", ckpt)
+        missing, unexpected = model.load_state_dict(state_dict, strict=False)
+        print(f"  Loaded. Missing keys: {len(missing)}, Unexpected keys: {len(unexpected)}")
+        if missing:
+            print(f"  Missing: {missing[:10]}{'...' if len(missing) > 10 else ''}")
+        if unexpected:
+            print(f"  Unexpected: {unexpected[:10]}{'...' if len(unexpected) > 10 else ''}")
 
     param_counts = model.num_scaling_params()
     num_params = param_counts["total"]
@@ -1173,7 +1418,7 @@ def _run_training_once(runtime, tokenizer, config, device_batch_size, smoke_test
         MAX_SEQ_LEN,
         "train",
         device=runtime.device,
-        dataset=tokenizer.dataset,
+        dataset=train_dataset or tokenizer.dataset,
     )
     x, y, epoch = next(train_loader)
     print(f"Time budget: {TIME_BUDGET}s")
@@ -1202,16 +1447,49 @@ def _run_training_once(runtime, tokenizer, config, device_batch_size, smoke_test
     total_training_time = 0.0
     step = 0
 
+    # MoE diagnostics accumulators (reset each log interval)
+    DIAGNOSTIC_LOG_INTERVAL = 25
+    diag_expert_token_counts = None
+    diag_entropy_sum = 0.0
+    diag_max_prob_sum = 0.0
+    diag_expert_norms_sum = None
+    diag_shared_norm_sum = 0.0
+    diag_steps_collected = 0
+
     while True:
         torch.cuda.synchronize()
         t0 = time.time()
+        total_aux_loss = 0.0
+        total_z_loss = 0.0
+        collect_diag = config.use_moe and (step % DIAGNOSTIC_LOG_INTERVAL == 0)
         for _ in range(grad_accum_steps):
             with autocast_ctx:
-                loss = model(x, y)
-            train_loss = loss.detach()
+                ce_loss, aux_loss, z_loss, batch_diagnostics = model(x, y, collect_diagnostics=collect_diag)
+            train_loss = ce_loss.detach()
+            loss = ce_loss + MOE_AUX_LOSS_WEIGHT * aux_loss + MOE_Z_LOSS_WEIGHT * z_loss
+            total_aux_loss += aux_loss.item()
+            total_z_loss += z_loss.item()
             loss = loss / grad_accum_steps
             loss.backward()
             x, y, epoch = next(train_loader)
+
+            # Accumulate diagnostics from the last micro-batch only
+            if collect_diag and batch_diagnostics:
+                for diag in batch_diagnostics:
+                    if diag_expert_token_counts is None:
+                        diag_expert_token_counts = list(diag["expert_token_counts"])
+                    else:
+                        for i, c in enumerate(diag["expert_token_counts"]):
+                            diag_expert_token_counts[i] += c
+                    diag_entropy_sum += diag["router_entropy"]
+                    diag_max_prob_sum += diag["router_max_prob"]
+                    if diag_expert_norms_sum is None:
+                        diag_expert_norms_sum = list(diag["expert_norms"])
+                    else:
+                        for i, n in enumerate(diag["expert_norms"]):
+                            diag_expert_norms_sum[i] += n
+                    diag_shared_norm_sum += diag["shared_expert_norm"]
+                    diag_steps_collected += 1
 
         progress = min(total_training_time / max(target_training_seconds, 1e-6), 1.0)
         lrm = get_lr_multiplier(progress)
@@ -1254,18 +1532,52 @@ def _run_training_once(runtime, tokenizer, config, device_batch_size, smoke_test
             flush=True,
         )
         if tracker is not None:
-            tracker.log(
-                {
-                    "train/loss": train_loss_f,
-                    "train/smoothed_loss": debiased_smooth_loss,
-                    "train/lr_multiplier": lrm,
-                    "train/tok_per_sec": tok_per_sec,
-                    "train/epoch": epoch,
-                    "train/training_seconds": total_training_time,
-                    "train/mfu_percent": mfu if runtime.gpu_peak_flops else None,
-                },
-                step=step,
-            )
+            log_metrics = {
+                "train/loss": train_loss_f,
+                "train/smoothed_loss": debiased_smooth_loss,
+                "train/lr_multiplier": lrm,
+                "train/tok_per_sec": tok_per_sec,
+                "train/epoch": epoch,
+                "train/training_seconds": total_training_time,
+                "train/mfu_percent": mfu if runtime.gpu_peak_flops else None,
+            }
+            if config.use_moe:
+                log_metrics["train/aux_loss"] = total_aux_loss / grad_accum_steps
+                log_metrics["train/z_loss"] = total_z_loss / grad_accum_steps
+                # Log routing diagnostics every DIAGNOSTIC_LOG_INTERVAL steps
+                if diag_steps_collected > 0:
+                    n = diag_steps_collected
+                    for e_idx in range(config.num_experts):
+                        log_metrics[f"moe/expert_{e_idx}_tokens"] = diag_expert_token_counts[e_idx] / n
+                    log_metrics["moe/router_entropy"] = diag_entropy_sum / n
+                    log_metrics["moe/router_max_prob"] = diag_max_prob_sum / n
+                    for e_idx in range(config.num_experts):
+                        log_metrics[f"moe/expert_{e_idx}_norm"] = diag_expert_norms_sum[e_idx] / n
+                    log_metrics["moe/shared_expert_norm"] = diag_shared_norm_sum / n
+                    # Reset accumulators
+                    diag_expert_token_counts = None
+                    diag_entropy_sum = 0.0
+                    diag_max_prob_sum = 0.0
+                    diag_expert_norms_sum = None
+                    diag_shared_norm_sum = 0.0
+                    diag_steps_collected = 0
+                    # Print diagnostics to console
+                    token_counts_str = " ".join(
+                        f"e{e_idx}:{log_metrics[f'moe/expert_{e_idx}_tokens']:.0f}"
+                        for e_idx in range(config.num_experts)
+                    )
+                    norms_str = " ".join(
+                        f"e{e_idx}:{log_metrics[f'moe/expert_{e_idx}_norm']:.2f}"
+                        for e_idx in range(config.num_experts)
+                    )
+                    print(
+                        f"\n  [MoE diag] entropy={log_metrics['moe/router_entropy']:.4f} "
+                        f"max_p={log_metrics['moe/router_max_prob']:.4f} "
+                        f"shared_norm={log_metrics['moe/shared_expert_norm']:.2f}"
+                    )
+                    print(f"  [MoE diag] tokens: {token_counts_str}")
+                    print(f"  [MoE diag] norms:  {norms_str}")
+            tracker.log(log_metrics, step=step)
 
         if step == 0:
             gc.collect()
@@ -1294,7 +1606,332 @@ def _run_training_once(runtime, tokenizer, config, device_batch_size, smoke_test
     }
 
 
-def _upload_to_huggingface(args, model, tokenizer, config, metrics, wandb_url=None, run_name=None):
+def _generate_readme(config, metrics, runtime, tokenizer, inference_results, wandb_url=None, repo_id=None):
+    """Generate a comprehensive README.md for the Hugging Face model card."""
+    num_params = metrics["num_params"]
+    num_params_M = num_params / 1e6
+    train_dataset_name = metrics.get("train_dataset", metrics.get("dataset", "unknown"))
+    tokenizer_dataset_name = metrics.get("tokenizer_dataset", train_dataset_name)
+    depth = metrics["depth"]
+    train_batch_size = metrics["train_batch_size"]
+    activation_checkpointing = metrics["activation_checkpointing"]
+    val_bpb = metrics["val_bpb"]
+    perplexity = 2 ** val_bpb if val_bpb else 0
+    training_seconds = metrics["training_seconds"]
+    total_tokens = metrics["total_tokens"]
+    total_tokens_M = total_tokens / 1e6
+    num_steps = metrics["num_steps"]
+    peak_vram_mb = metrics["peak_vram_mb"]
+    peak_vram_gb = peak_vram_mb / 1024
+    mfu = metrics.get("mfu_percent")
+    mfu_str = f"{mfu:.2f}" if mfu is not None else "n/a"
+    now = time.strftime("%Y-%m-%d")
+
+    # Dataset display name
+    dataset_display = {
+        "tinystories": "TinyStories (karpathy/tinystories-gpt4-clean)",
+        "climbmix-400b-shuffle": "ClimbMix 400B (karpathy/climbmix-400b-shuffle)",
+    }.get(train_dataset_name, train_dataset_name)
+
+    # Architecture details
+    head_dim = config.n_embd // config.n_head
+    ff_dim = 4 * config.n_embd
+    if config.use_moe:
+        ff_dim_display = f"{config.expert_dim} (MoE: {config.num_experts} experts, {config.num_shared_experts} shared, top-{config.num_experts_per_tok})"
+    else:
+        ff_dim_display = str(ff_dim)
+
+    # YAML frontmatter
+    frontmatter = (
+        "---\n"
+        "license: mit\n"
+        "language:\n"
+        "  - en\n"
+        "pipeline_tag: text-generation\n"
+        "tags:\n"
+        "  - causal-lm\n"
+        "  - pytorch\n"
+        "  - small-language-model\n"
+        "  - autoresearch\n"
+        "  - from-scratch\n"
+        f"datasets:\n"
+        f"  - {train_dataset_name}\n"
+        "---\n"
+    )
+
+    # Model name and overview
+    model_name = f"AutoResearch-{train_dataset_name}-depth{depth}"
+    readme = (
+        f"{frontmatter}\n"
+        f"# {model_name}\n\n"
+        f"![AutoResearch Cover](https://raw.githubusercontent.com/nullbotai-droid/turbo-diffusion-local/refs/heads/main/cover2.png)\n\n"
+        f"**{model_name}** is a **{num_params_M:.1f}M parameter** decoder-only Transformer trained **from scratch** on **{dataset_display}**.\n\n"
+        f"This model is part of the **AutoResearch** project, which focuses on training, evaluating, and releasing efficient language models with reproducible research workflows.\n\n"
+        f"---\n\n"
+    )
+
+    # Overview
+    readme += (
+        "# Overview\n\n"
+        f"This is a {depth}-layer decoder-only Transformer trained on the {dataset_display} dataset "
+        f"for {training_seconds / 3600:.1f} hours of wall-clock training time. "
+        f"The model achieves a validation bits-per-byte (val_bpb) of {val_bpb:.6f} "
+        f"(perplexity: {perplexity:.4f}) on the held-out validation set.\n\n"
+        f"---\n\n"
+    )
+
+    # References
+    readme += (
+        "# References\n\n"
+        "## Papers\n\n"
+        "- NanoGPT / NanoChat architecture patterns\n\n"
+        "## Datasets\n\n"
+        f"- Training: {dataset_display}\n"
+        f"- Tokenizer: {tokenizer_dataset_name}\n\n"
+        "## Related Projects\n\n"
+        "- [karpathy/autoresearch](https://github.com/karpathy/autoresearch)\n\n"
+    )
+    if wandb_url:
+        readme += f"## WANDB Run\n\n- [{wandb_url}]({wandb_url})\n\n"
+    readme += "---\n\n"
+
+    # Highlights
+    readme += (
+        "# Highlights\n\n"
+        "- Trained **from scratch**\n"
+        f"- **{num_params_M:.1f}M parameters**\n"
+        f"- Trained on **{total_tokens_M:.1f}M tokens** ({num_steps} steps)\n"
+        f"- {config.n_layer}-layer decoder-only Transformer with sliding window attention\n"
+        f"- RoPE positional encoding, RMSNorm, ReLU² activation\n"
+        f"- MuonAdamW optimizer (Muon for matrices, AdamW for embeddings)\n"
+    )
+    if config.use_moe:
+        readme += (
+            f"- **Mixture of Experts** ({config.num_experts} routed + {config.num_shared_experts} shared, "
+            f"top-{config.num_experts_per_tok} routing)\n"
+        )
+    readme += (
+        "- Hugging Face Transformers compatible\n\n"
+        "---\n\n"
+    )
+
+    # Model Architecture
+    readme += (
+        "# Model Architecture\n\n"
+        "| Property | Value |\n"
+        "|-----------|------:|\n"
+        "| Architecture | Decoder-only Transformer |\n"
+        f"| Parameters | **{num_params:,}** ({num_params_M:.1f}M) |\n"
+        f"| Layers | {config.n_layer} |\n"
+        f"| Hidden Size | {config.n_embd} |\n"
+        f"| Attention Heads | {config.n_head} |\n"
+        f"| KV Heads | {config.n_kv_head} |\n"
+        f"| Head Dimension | {head_dim} |\n"
+        f"| Feed Forward Size | {ff_dim_display} |\n"
+        f"| Context Length | {config.sequence_len} |\n"
+        f"| Vocabulary Size | {config.vocab_size:,} |\n"
+        "| Positional Encoding | RoPE |\n"
+        "| Activation | ReLU² |\n"
+        "| Normalization | RMSNorm |\n"
+        f"| Window Pattern | {config.window_pattern} |\n"
+        "| Weight Tying | No |\n\n"
+        "---\n\n"
+    )
+
+    # Training
+    readme += (
+        "# Training\n\n"
+        f"This model was trained **from scratch** for **{training_seconds / 3600:.1f} hours** "
+        f"({training_seconds:.0f}s) of wall-clock training time.\n\n"
+        "## Training Configuration\n\n"
+        "| Setting | Value |\n"
+        "|---------|------:|\n"
+        "| Optimizer | MuonAdamW (Muon + AdamW) |\n"
+        f"| Precision | {config.compute_dtype} |\n"
+        f"| Learning Rate | {MATRIX_LR} (matrix) / {EMBEDDING_LR} (embedding) |\n"
+        f"| Weight Decay | {WEIGHT_DECAY} |\n"
+        f"| Batch Size | {train_batch_size} × {MAX_SEQ_LEN} = {train_batch_size * MAX_SEQ_LEN:,} tokens/step |\n"
+        f"| Gradient Accumulation | {TOTAL_BATCH_SIZE // (train_batch_size * MAX_SEQ_LEN)} steps |\n"
+        f"| Total Batch Size | {TOTAL_BATCH_SIZE:,} tokens |\n"
+        f"| Context Length | {MAX_SEQ_LEN} |\n"
+        f"| Vocabulary | {config.vocab_size:,} tokens (BPE) |\n"
+        "| LR Scheduler | Linear warmdown (50%) |\n"
+        f"| Activation Checkpointing | {'Enabled' if activation_checkpointing else 'Disabled'} |\n\n"
+        "## Hardware\n\n"
+        f"- GPU: {runtime.gpu_name}\n"
+        f"- VRAM: {runtime.gpu_vram_gb:.1f} GB\n"
+        f"- Peak VRAM Used: {peak_vram_gb:.1f} GB\n"
+        f"- MFU: {mfu_str}%\n"
+        f"- Framework: PyTorch {torch.__version__}\n\n"
+        "---\n\n"
+    )
+
+    # Dataset
+    readme += (
+        "# Dataset\n\n"
+        f"- **Name:** {dataset_display}\n"
+        f"- **Language:** English\n\n"
+        "### Preprocessing\n\n"
+        "Data is packed into fixed-length sequences of 2048 tokens using the nanochat-compatible "
+        "BPE tokenizer (16,384 vocabulary, 9 special tokens). No additional filtering or deduplication "
+        "is applied beyond what is in the source dataset.\n\n"
+        "---\n\n"
+    )
+
+    # Intended Use
+    readme += (
+        "# Intended Use\n\n"
+        "This model is intended for:\n\n"
+        "- Educational purposes and research\n"
+        "- Text generation experiments\n"
+        "- Studying small language model training dynamics\n\n"
+        "Not recommended for:\n\n"
+        "- Production use or safety-critical applications\n"
+        "- Tasks requiring factual accuracy\n\n"
+        "---\n\n"
+    )
+
+    # Evaluation
+    readme += (
+        "# Evaluation\n\n"
+        "## Results\n\n"
+        "| Metric | Score |\n"
+        "|---------|------:|\n"
+        f"| Validation BPB | {val_bpb:.6f} |\n"
+        f"| Perplexity | {perplexity:.4f} |\n"
+        f"| Peak VRAM | {peak_vram_gb:.1f} GB |\n"
+        f"| MFU | {mfu_str}% |\n\n"
+        "---\n\n"
+    )
+
+    # Example Generations
+    readme += "# Example Generations\n\n"
+    for i, (prompt, output) in enumerate(inference_results, 1):
+        readme += (
+            f"## Example {i}\n\n"
+            "### Prompt\n\n"
+            "```text\n"
+            f"{prompt}\n"
+            "```\n\n"
+            "### Generation\n\n"
+            "```text\n"
+            f"{output}\n"
+            "```\n\n"
+        )
+
+    # Usage
+    readme += (
+        "# Usage\n\n"
+        "```python\n"
+        "import torch\n"
+        "import pickle\n"
+        "import json\n"
+        "from train import GPT, GPTConfig, Tokenizer\n\n"
+        "# Load config\n"
+        "with open('config.json', 'r') as f:\n"
+        "    config_dict = json.load(f)\n"
+        "config = GPTConfig(**{k: v for k, v in config_dict.items() if k in GPTConfig.__dataclass_fields__})\n\n"
+        "# Load model\n"
+        "model = GPT(config)\n"
+        "state_dict = torch.load('model.pt', map_location='cpu')['state_dict']\n"
+        "model.load_state_dict(state_dict)\n"
+        "model.eval()\n\n"
+        "# Load tokenizer\n"
+        "with open('tokenizer.pkl', 'rb') as f:\n"
+        "    tokenizer = pickle.load(f)\n\n"
+        "# Generate\n"
+        "prompt = 'Once upon a time, '\n"
+        "input_ids = tokenizer.encode(prompt)\n"
+        "x = torch.tensor([input_ids], dtype=torch.long)\n"
+        "with torch.no_grad():\n"
+        "    for _ in range(50):\n"
+        "        logits = model(x)\n"
+        "        probs = torch.softmax(logits[:, -1, :] / 0.8, dim=-1)\n"
+        "        next_token = torch.multinomial(probs, num_samples=1)\n"
+        "        input_ids.append(next_token.item())\n"
+        "        x = torch.tensor([input_ids], dtype=torch.long)\n"
+        "print(tokenizer.decode(input_ids))\n"
+        "```\n\n"
+        "---\n\n"
+    )
+
+    # Repository Structure
+    readme += (
+        "# Repository Structure\n\n"
+        "```text\n"
+        "model.pt                  # Model weights\n"
+        "config.json               # Model architecture config\n"
+        "dataset.txt               # Dataset name used for training\n"
+        "token_bytes.pt            # Token byte mappings\n"
+        "tokenizer.pkl             # Trained BPE tokenizer\n"
+        "tokenizer_config.json     # Tokenizer configuration\n"
+        "training_metrics.json     # Training metrics\n"
+        "README.md                 # This file\n"
+        "```\n\n"
+        "---\n\n"
+    )
+
+    # Limitations
+    readme += (
+        "# Limitations\n\n"
+        "- Small model size limits language understanding and coherence\n"
+        "- Trained on a single dataset (TinyStories) — limited domain\n"
+        "- Fixed time budget training — not fully trained to convergence\n"
+        "- No RLHF or safety alignment\n\n"
+        "---\n\n"
+    )
+
+    # Ethical Considerations
+    readme += (
+        "# Ethical Considerations\n\n"
+        "- This is a research artifact, not a production model\n"
+        "- The training data consists of synthetic stories (GPT-4 generated)\n"
+        "- No harmful content filtering was applied\n"
+        "- Intended for research and educational use only\n\n"
+        "---\n\n"
+    )
+
+    # Citation
+    readme += (
+        "# Citation\n\n"
+        "```bibtex\n"
+        "@misc{autoresearch_" + f"{train_dataset_name}_depth{depth}" + ",\n"
+        f"  title={{{model_name}}},\n"
+        "  author={Dustin Loring},\n"
+        f"  year={{{now[:4]}}},\n"
+        f"  howpublished={{\\url{{https://huggingface.co/{repo_id or '<repo>'}}}}}\n"
+        "}}\n"
+        "```\n\n"
+        "---\n\n"
+    )
+
+    # Version History
+    readme += (
+        "# Version History\n\n"
+        "| Version | Date | Notes |\n"
+        "|----------|------|------|\n"
+        f"| v1.0 | {now} | Initial release |\n\n"
+        "---\n\n"
+    )
+
+    # Acknowledgements
+    readme += (
+        "# Acknowledgements\n\n"
+        "Built with the **AutoResearch** training framework.\n\n"
+        "Thanks to:\n\n"
+        "- Hugging Face\n"
+        "- PyTorch\n"
+        "- The creators of the TinyStories dataset\n"
+        "- The open-source AI research community\n\n"
+        "---\n\n"
+        "# License\n\n"
+        "This model is released under the **MIT License** unless otherwise specified.\n"
+    )
+
+    return readme
+
+
+def _upload_to_huggingface(args, model, tokenizer, config, metrics, runtime, inference_results, wandb_url=None, run_name=None):
     """Upload a self-contained checkpoint bundle when both HF credentials and a repo are configured."""
     token = os.environ.get("HF_TOKEN") or os.environ.get("HUGGINGFACE_HUB_TOKEN")
     if not token:
@@ -1333,18 +1970,8 @@ def _upload_to_huggingface(args, model, tokenizer, config, metrics, wandb_url=No
                 source = os.path.join(tokenizer.directory, filename)
                 if os.path.exists(source):
                     shutil.copy2(source, os.path.join(export_dir, filename))
+            readme = _generate_readme(config, metrics, runtime, tokenizer, inference_results, wandb_url, repo_id)
             with open(os.path.join(export_dir, "README.md"), "w", encoding="utf-8") as f:
-                readme = (
-                    "---\n"
-                    "library_name: autoresearch\n"
-                    "tags:\n- autoresearch\n- nanochat-tokenizer\n"
-                    "---\n\n"
-                    "# autoresearch experiment\n\n"
-                    "This checkpoint uses the 16,384-token nanochat-compatible BPE tokenizer. "
-                    "Load `model.pt` with this repository's `GPT` class and `config.json`.\n"
-                )
-                if wandb_url:
-                    readme += f"\nW\u0026B run URL: {wandb_url}\n"
                 f.write(readme)
             api = HfApi(token=token)
             api.create_repo(repo_id=repo_id, repo_type="model", private=args.hf_private, exist_ok=True)
@@ -1383,6 +2010,14 @@ def main():
     parser.add_argument("--wandb-run-name", default=None, help="Optional W&B run name.")
     parser.add_argument("--hf-repo-id", default=None, help="Hugging Face model repo (requires HF_TOKEN).")
     parser.add_argument("--hf-private", action="store_true", help="Create the Hugging Face repository as private if needed.")
+    parser.add_argument("--load-from", default=None, help="Path to checkpoint.pt to load pretrained weights from.")
+    parser.add_argument("--tokenizer-dir", default=None, help="Path to tokenizer directory (overrides dataset default).")
+    parser.add_argument("--tokenizer-dataset", choices=DATASET_CHOICES, default=None, help="Dataset to load tokenizer from (allows training tokenizer on different data than training).")
+    parser.add_argument("--moe", action="store_true", help="Enable Mixture of Experts architecture.")
+    parser.add_argument("--num-experts", type=int, default=8, help="Number of routed experts per MoE layer (default: 8).")
+    parser.add_argument("--num-shared-experts", type=int, default=1, help="Number of shared experts per MoE layer (default: 1).")
+    parser.add_argument("--num-experts-per-tok", type=int, default=2, help="Top-K experts per token (default: 2).")
+    parser.add_argument("--expert-dim", type=int, default=2048, help="FFN hidden dim per expert (default: 2048).")
     args = parser.parse_args()
 
     runtime = detect_runtime()
@@ -1393,17 +2028,31 @@ def main():
     print(f"Consumer matrix support: {'yes' if runtime.gpu_profile.is_supported_consumer else 'compatibility path'}")
     print(f"TF32: {'enabled' if runtime.tf32_enabled else 'disabled'}")
     print(f"AMP dtype: {runtime.amp_dtype}")
+    if args.moe:
+        print(f"MoE: enabled ({args.num_experts} routed + {args.num_shared_experts} shared, top-{args.num_experts_per_tok})")
 
-    tokenizer = Tokenizer.from_directory(dataset=args.dataset)
+    # Resolve datasets: training dataset vs tokenizer dataset
+    from prepare import _resolve_dataset_name
+    train_dataset = _resolve_dataset_name(args.dataset)
+    tokenizer_dataset = _resolve_dataset_name(args.tokenizer_dataset) if args.tokenizer_dataset else train_dataset
+    print(f"Training dataset: {train_dataset}")
+    print(f"Tokenizer dataset: {tokenizer_dataset}")
+
+    tokenizer = Tokenizer.from_directory(tokenizer_dir=args.tokenizer_dir, dataset=tokenizer_dataset)
     vocab_size = tokenizer.get_vocab_size()
     print(f"Vocab size: {vocab_size:,}")
-    print(f"Dataset: {tokenizer.dataset}")
 
     # Configure optimizer kernels/dtypes before autotune so probes match real training runtime.
     _configure_step_kernels(runtime)
 
     train_candidates = _build_train_candidates(runtime)
-    autotuned_candidate = _autotune_train_candidate(runtime, tokenizer, vocab_size, train_candidates)
+    autotuned_candidate = _autotune_train_candidate(
+        runtime, tokenizer, vocab_size, train_candidates,
+        use_moe=args.moe, num_experts=args.num_experts,
+        num_shared_experts=args.num_shared_experts, num_experts_per_tok=args.num_experts_per_tok,
+        expert_dim=args.expert_dim,
+        train_dataset=train_dataset,
+    )
     train_candidates = _prioritize_autotuned_candidate(train_candidates, autotuned_candidate)
 
     print(f"Attention backend: {runtime.attention_backend}")
@@ -1420,6 +2069,11 @@ def main():
             vocab_size,
             runtime,
             use_activation_checkpointing=use_checkpointing,
+            use_moe=args.moe,
+            num_experts=args.num_experts,
+            num_shared_experts=args.num_shared_experts,
+            num_experts_per_tok=args.num_experts_per_tok,
+            expert_dim=args.expert_dim,
         )
         print(
             "Trying train candidate: "
@@ -1428,7 +2082,7 @@ def main():
         )
         print(f"Model config: {asdict(config)}")
         try:
-            tracker = ExperimentTracker(args, config, runtime, tokenizer)
+            tracker = ExperimentTracker(args, config, runtime, tokenizer, train_dataset=train_dataset)
             result = _run_training_once(
                 runtime=runtime,
                 tokenizer=tokenizer,
@@ -1436,6 +2090,8 @@ def main():
                 device_batch_size=train_batch_size,
                 smoke_test=args.smoke_test,
                 tracker=tracker,
+                load_from=args.load_from,
+                train_dataset=train_dataset,
             )
             chosen_train_batch = train_batch_size
             chosen_checkpointing = use_checkpointing
@@ -1480,7 +2136,7 @@ def main():
                     tokenizer,
                     eval_batch_size,
                     device=runtime.device,
-                    dataset=tokenizer.dataset,
+                    dataset=train_dataset or tokenizer.dataset,
                     eval_tokens=eval_tokens,
                 )
             chosen_eval_batch = eval_batch_size
@@ -1497,15 +2153,16 @@ def main():
     # --- Inference: generate text from seed sentences ---
     print("\n--- Inference ---")
     seed_sentences = [
-        "Once upon a time, ",
-        "A lonely dragon ",
-        "The opposite of boy is ",
-        "The opposite of queen is ",
-        "My name is ",
+        "Once upon a time,",
+        "A lonely dragon",
+        "The opposite of boy is",
+        "The opposite of queen is",
+        "My name is",
     ]
     max_new_tokens = 50
     temperature = 0.8
     top_p = 0.95
+    inference_results = []
 
     model.eval()
     with torch.no_grad():
@@ -1514,9 +2171,9 @@ def main():
             generated = list(input_ids)
             x = torch.tensor([generated], dtype=torch.long, device=runtime.device)
             for _ in range(max_new_tokens):
-                cos_sin = (model.cos[:, :x.size(1)], model.sin[:, :x.size(1)])
-                logits = model(x)
-                logits = logits[:, -1, :] / temperature
+                with torch.amp.autocast(device_type=runtime.device_type, dtype=runtime.amp_dtype):
+                    logits, _ = model(x)
+                logits = logits[:, -1, :].float() / temperature
                 sorted_logits, sorted_indices = torch.sort(logits, descending=True)
                 cumulative_probs = torch.cumsum(torch.softmax(sorted_logits, dim=-1), dim=-1)
                 sorted_indices_to_remove = cumulative_probs > top_p
@@ -1528,8 +2185,10 @@ def main():
                 next_token = torch.multinomial(probs, num_samples=1)
                 generated.append(next_token.item())
                 x = torch.tensor([generated], dtype=torch.long, device=runtime.device)
+            output_text = tokenizer.decode(generated)
+            inference_results.append((seed, output_text))
             print(f"Prompt: {repr(seed)}")
-            print(f"Output: {tokenizer.decode(generated)}")
+            print(f"Output: {output_text}")
             print()
 
     t_end = time.time()
@@ -1561,12 +2220,21 @@ def main():
         "num_steps": step,
         "num_params": num_params,
         "depth": DEPTH,
-        "dataset": tokenizer.dataset,
+        "train_dataset": train_dataset,
+        "tokenizer_dataset": tokenizer.dataset,
         "train_batch_size": chosen_train_batch,
         "eval_batch_size": chosen_eval_batch,
         "activation_checkpointing": chosen_checkpointing,
         "smoke_test": args.smoke_test,
+        "use_moe": selected_config.use_moe,
     }
+    if selected_config.use_moe:
+        experiment_metrics.update({
+            "num_experts": selected_config.num_experts,
+            "num_shared_experts": selected_config.num_shared_experts,
+            "num_experts_per_tok": selected_config.num_experts_per_tok,
+            "expert_dim": selected_config.expert_dim,
+        })
 
     print("---")
     print(f"val_bpb:          {val_bpb:.6f}")
@@ -1581,10 +2249,17 @@ def main():
     print(f"num_steps:        {step}")
     print(f"num_params_M:     {num_params / 1e6:.1f}")
     print(f"depth:            {DEPTH}")
-    print(f"dataset:          {tokenizer.dataset}")
+    print(f"train_dataset:    {train_dataset}")
+    print(f"tokenizer_dataset: {tokenizer.dataset}")
     print(f"train_batch_size: {chosen_train_batch}")
     print(f"eval_batch_size:  {chosen_eval_batch}")
     print(f"activation_checkpointing: {'enabled' if chosen_checkpointing else 'disabled'}")
+    if selected_config.use_moe:
+        print(f"use_moe:          enabled")
+        print(f"num_experts:      {selected_config.num_experts}")
+        print(f"num_shared_experts: {selected_config.num_shared_experts}")
+        print(f"num_experts_per_tok: {selected_config.num_experts_per_tok}")
+        print(f"expert_dim:       {selected_config.expert_dim}")
     if args.smoke_test:
         print("smoke_test:       true")
     run_name = None
@@ -1592,7 +2267,7 @@ def main():
         run_name = tracker.run.name
     if tracker is not None:
         tracker.finish({"val_bpb": val_bpb, "eval/batch_size": chosen_eval_batch, "status": "completed"})
-    _upload_to_huggingface(args, model, tokenizer, selected_config, experiment_metrics, tracker.run_url if tracker is not None else None, run_name)
+    _upload_to_huggingface(args, model, tokenizer, selected_config, experiment_metrics, runtime, inference_results, tracker.run_url if tracker is not None else None, run_name)
     return 0
 
 

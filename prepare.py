@@ -29,7 +29,7 @@ import torch
 # ---------------------------------------------------------------------------
 
 MAX_SEQ_LEN = 2048          # context length
-TIME_BUDGET = 3600           # training time budget in seconds (5 minutes)
+TIME_BUDGET = 600            # training time budget in seconds (10 minutes)
 EVAL_TOKENS = 40 * 524288   # number of tokens for validation eval
 VOCAB_SIZE = 16_384  # Half of nanochat's 32K default; 
 
@@ -57,7 +57,7 @@ TOKENIZER_FORMAT = "nanochat-rustbpe-v1"
 # ---------------------------------------------------------------------------
 
 DEFAULT_DATASET = "tinystories"
-DATASET_CHOICES = ("tinystories",)
+DATASET_CHOICES = ("tinystories", "fineweb-edu-100b-shuffle", "climbmix-400b-shuffle")
 
 
 def _default_cache_dir():
@@ -90,6 +90,22 @@ DATASET_CONFIGS = {
             "test": (0, 10_000),
             "val": (10_000, 20_000),
             "train": (20_000, None),
+        },
+    },
+    "fineweb-edu-100b-shuffle": {
+        "repo_id": "karpathy/fineweb-edu-100b-shuffle",
+        "shards_to_download": 10,
+        "splits": {
+            "val": (0, 10_000),
+            "train": (10_000, None),
+        },
+    },
+    "climbmix-400b-shuffle": {
+        "repo_id": "karpathy/climbmix-400b-shuffle",
+        "shards_to_download": 10,
+        "splits": {
+            "val": (0, 10_000),
+            "train": (10_000, None),
         },
     },
 }
@@ -229,9 +245,50 @@ def _download_tinystories_file(dataset_name):
     print(f"Data: downloaded {filename} to {filepath}")
 
 
+def _download_sharded_dataset(dataset_name):
+    config = DATASET_CONFIGS[dataset_name]
+    data_dir = _data_dir(dataset_name)
+    os.makedirs(data_dir, exist_ok=True)
+
+    repo_id = config["repo_id"]
+    shards_to_download = config.get("shards_to_download", 10)
+
+    from huggingface_hub import list_repo_files, hf_hub_download
+    all_files = list_repo_files(repo_id, repo_type="dataset")
+    parquet_files = sorted([f for f in all_files if f.endswith(".parquet")])
+
+    downloaded_files = []
+    for i, filename in enumerate(parquet_files[:shards_to_download]):
+        filepath = os.path.join(data_dir, filename)
+        if os.path.exists(filepath):
+            print(f"Data: {filename} already downloaded")
+            downloaded_files.append(filepath)
+            continue
+        print(f"Data: downloading shard {i+1}/{shards_to_download} ({filename})...")
+        try:
+            downloaded_path = hf_hub_download(
+                repo_id=repo_id,
+                filename=filename,
+                repo_type="dataset",
+                local_dir=data_dir,
+            )
+            if downloaded_path != filepath:
+                shutil.copy2(downloaded_path, filepath)
+            downloaded_files.append(filepath)
+            print(f"Data: downloaded {filename}")
+        except Exception as exc:
+            print(f"Data: failed to download {filename}: {exc}")
+
+    print(f"Data: downloaded {len(downloaded_files)} shards to {data_dir}")
+    return downloaded_files
+
+
 def download_data(dataset_name):
     dataset = _resolve_dataset_name(dataset_name)
-    _download_tinystories_file(dataset)
+    if dataset in ("fineweb-edu-100b-shuffle", "climbmix-400b-shuffle"):
+        _download_sharded_dataset(dataset)
+    else:
+        _download_tinystories_file(dataset)
 
 
 # ---------------------------------------------------------------------------
@@ -243,10 +300,16 @@ def list_parquet_files(dataset_name=None):
     data_dir = _data_dir(dataset)
     files = []
     if os.path.exists(data_dir):
-        files = sorted(
-            name for name in os.listdir(data_dir)
-            if name.endswith(".parquet") and not name.endswith(".tmp")
-        )
+        if dataset in ("fineweb-edu-100b-shuffle", "climbmix-400b-shuffle"):
+            files = sorted([
+                name for name in os.listdir(data_dir)
+                if name.endswith(".parquet") and name.startswith("shard_")
+            ])
+        else:
+            files = sorted(
+                name for name in os.listdir(data_dir)
+                if name.endswith(".parquet") and not name.endswith(".tmp")
+            )
     if files:
         return [os.path.join(data_dir, name) for name in files]
     if dataset == "tinystories":
@@ -282,11 +345,47 @@ def _iter_tinystories_texts(split, dataset_name=None):
             current_idx += 1
 
 
+def _iter_sharded_texts(split, dataset_name=None):
+    dataset = _resolve_dataset_name(dataset_name)
+    config = DATASET_CONFIGS[dataset]
+    start_idx, end_idx = config["splits"][split]
+    data_dir = _data_dir(dataset)
+
+    parquet_files = sorted([
+        os.path.join(data_dir, f)
+        for f in os.listdir(data_dir)
+        if f.endswith(".parquet") and f.startswith("shard_")
+    ])
+
+    if not parquet_files:
+        raise FileNotFoundError(
+            f"FineWeb parquet shards not found in {data_dir}. Run prepare.py first."
+        )
+
+    current_idx = 0
+    for filepath in parquet_files:
+        parquet_file = pq.ParquetFile(filepath)
+        for row_group_idx in range(parquet_file.num_row_groups):
+            row_group = parquet_file.read_row_group(row_group_idx, columns=["text"])
+            texts = row_group.column("text").to_pylist()
+            for text in texts:
+                if current_idx < start_idx:
+                    current_idx += 1
+                    continue
+                if end_idx is not None and current_idx >= end_idx:
+                    return
+                yield text
+                current_idx += 1
+
+
 def text_iterator(dataset_name=None, max_chars=1_000_000_000, doc_cap=10_000):
     dataset = _resolve_dataset_name(dataset_name)
     chars = 0
 
-    text_iter = _iter_tinystories_texts("train", dataset_name=dataset)
+    if dataset in ("fineweb-edu-100b-shuffle", "climbmix-400b-shuffle"):
+        text_iter = _iter_sharded_texts("train", dataset_name=dataset)
+    else:
+        text_iter = _iter_tinystories_texts("train", dataset_name=dataset)
     for text in text_iter:
         doc = text[:doc_cap] if len(text) > doc_cap else text
         chars += len(doc)
@@ -463,9 +562,12 @@ class Tokenizer:
         return self.enc.decode(ids)
 
 
-def get_token_bytes(device="cpu", dataset=None):
-    dataset_name = _resolve_dataset_name(dataset)
-    path = os.path.join(_tokenizer_dir(dataset_name), "token_bytes.pt")
+def get_token_bytes(device="cpu", dataset=None, tokenizer_dir=None):
+    if tokenizer_dir is not None:
+        path = os.path.join(tokenizer_dir, "token_bytes.pt")
+    else:
+        dataset_name = _resolve_dataset_name(dataset)
+        path = os.path.join(_tokenizer_dir(dataset_name), "token_bytes.pt")
     with open(path, "rb") as f:
         return torch.load(f, map_location=device)
 
@@ -477,7 +579,11 @@ def _document_batches(split, dataset=None, tokenizer_batch_size=128):
     epoch = 1
     while True:
         batch = []
-        for text in _iter_tinystories_texts(split, dataset_name=dataset_name):
+        if dataset_name in ("fineweb-edu-100b-shuffle", "climbmix-400b-shuffle"):
+            text_iter = _iter_sharded_texts(split, dataset_name=dataset_name)
+        else:
+            text_iter = _iter_tinystories_texts(split, dataset_name=dataset_name)
+        for text in text_iter:
             batch.append(text)
             if len(batch) >= tokenizer_batch_size:
                 yield batch, epoch
@@ -574,7 +680,7 @@ def evaluate_bpb(model, tokenizer, batch_size, device="cuda", dataset=None, eval
     are excluded from both sums.
     """
     dataset_name = _resolve_dataset_name(dataset or getattr(tokenizer, "dataset", None))
-    token_bytes = get_token_bytes(device=device, dataset=dataset_name)
+    token_bytes = get_token_bytes(device=device, tokenizer_dir=tokenizer.directory)
     val_loader = make_dataloader(
         tokenizer,
         batch_size,
@@ -588,7 +694,10 @@ def evaluate_bpb(model, tokenizer, batch_size, device="cuda", dataset=None, eval
     total_bytes = 0
     for _ in range(steps):
         x, y, _ = next(val_loader)
-        loss_flat = model(x, y, reduction="none").view(-1)
+        out = model(x, y, reduction="none")
+        if isinstance(out, tuple):
+            out = out[0]
+        loss_flat = out.view(-1)
         y_flat = y.view(-1)
         nbytes = token_bytes[y_flat]
         mask = nbytes > 0
