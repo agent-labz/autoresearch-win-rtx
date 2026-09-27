@@ -7,6 +7,7 @@ Usage: uv run train.py
 import argparse
 import gc
 import json
+import math
 import os
 import platform
 import time
@@ -833,6 +834,22 @@ WARMUP_RATIO = 0.0
 WARMDOWN_RATIO = 0.5
 FINAL_LR_FRAC = 0.0
 
+# Terminal Shrinkage Averaging, arXiv:2609.25482.
+# theta_hat = (1 - TSA_ALPHA) * theta_T + TSA_ALPHA * mean(theta over the terminal window).
+# TSA_ALPHA = 0.0 disables averaging entirely and leaves the run bit-identical to
+# the pre-TSA baseline, including the allocation of the accumulator.
+# TSA_WINDOW_FRAC is the window as a fraction of the wall-clock budget, not of the
+# step count, because the step count is not known in advance (train.py exits on
+# wall clock). One snapshot is taken per optimizer step inside the window, so the
+# number of averaged iterates adapts to however many steps the run actually took.
+TSA_ALPHA = 0.0
+TSA_WINDOW_FRAC = 0.25
+
+# Clamp on the terminal learning-rate multiplier, as a fraction of peak. Same paper.
+# 0.0 reproduces FINAL_LR_FRAC = 0.0 exactly; the floor is inactive unless it exceeds
+# FINAL_LR_FRAC. Their grid is {0.05, 0.10, 0.15}; the paper's best arm is 0.15.
+TERMINAL_FLOOR_FRAC = 0.0
+
 # Model size + memory defaults
 DEPTH = 8
 DEVICE_BATCH_SIZE = 16
@@ -1082,6 +1099,136 @@ def _configure_step_kernels(runtime):
     USE_COMPILE = False
 
 
+def _unwrap_model(model):
+    return model._orig_mod if hasattr(model, "_orig_mod") else model
+
+
+class TerminalWindowAverager:
+    """Running sum of the iterates inside the terminal window, kept on CPU in fp32.
+
+    Terminal Shrinkage Averaging (arXiv:2609.25482) needs the uniform mean of the
+    last K iterates, but the step count is not known in advance here, so K is not
+    settable. Instead the window is a fixed fraction of the wall-clock budget and
+    one snapshot is taken per optimizer step inside it, which makes the realised K
+    equal to however many steps the run actually spent in the window.
+
+    Only the running sum is stored, not the individual iterates, because the
+    newest iterate is already the live parameter and TSA needs the mean, not the
+    members. The accumulator is float32 on the host: 4 bytes x parameter count,
+    which is 201 MB at the stock 50,332,176 parameters, against the 90% VRAM gate
+    the autotune probe enforces. Keeping it off the GPU is what makes the change
+    invisible to the autotune decision.
+    """
+
+    def __init__(self, module, window_frac):
+        self.window_frac = window_frac
+        self.threshold = 1.0 - window_frac
+        self.names = [name for name, p in module.named_parameters() if p.requires_grad]
+        # Allocated here rather than on the first snapshot: the loop times each step
+        # with time.time() around it, so a mid-loop allocation would be charged to
+        # the following step's dt and silently eat into the 300 s budget.
+        self.sums = [
+            torch.zeros(p.shape, dtype=torch.float32, device="cpu")
+            for p in module.parameters()
+            if p.requires_grad
+        ]
+        self.count = 0
+        self.first_step = None
+        self.last_progress = None
+        # Running sum of ||theta_t||^2, one scalar per tensor. With the running sum
+        # above this gives the window's total squared spread,
+        #   sum_t ||theta_t - mean||^2 = energy - count * ||mean||^2,
+        # i.e. the exact amount of variation the average has to work with, for the
+        # cost of one dot product per snapshot and no extra tensor memory. It is
+        # what tells us whether the window held a moving trajectory or a single
+        # point repeated, which is the failure mode that matters at this step count.
+        self.energy = [0.0] * len(self.sums)
+
+    def in_window(self, progress):
+        return progress >= self.threshold
+
+    @torch.no_grad()
+    def snapshot(self, module, step, progress):
+        params = [p for p in module.parameters() if p.requires_grad]
+        if len(params) != len(self.sums):
+            raise RuntimeError("parameter set changed after the averager was built")
+        for i, (acc, p) in enumerate(zip(self.sums, params)):
+            host = p.detach().to(device="cpu", dtype=torch.float32)
+            acc.add_(host)
+            self.energy[i] += float(torch.dot(host.reshape(-1), host.reshape(-1)))
+        self.count += 1
+        if self.first_step is None:
+            self.first_step = step
+        self.last_progress = progress
+
+    @torch.no_grad()
+    def apply(self, module, alpha):
+        """Replace the live parameters with (1-alpha)*theta_T + alpha*mean(window)."""
+        if alpha == 0.0 or self.count == 0:
+            return False
+        params = [p for p in module.parameters() if p.requires_grad]
+        if len(params) != len(self.sums):
+            raise RuntimeError("parameter set changed after the averager was built")
+        for p, acc in zip(params, self.sums):
+            mean = acc / self.count
+            raw = p.detach().to(device="cpu", dtype=torch.float32)
+            blended = (1.0 - alpha) * raw + alpha * mean
+            p.copy_(blended.to(device=p.device, dtype=p.dtype))
+        return True
+
+    def diagnostics(self, module):
+        """Window spread and the displacement the blend actually applies.
+
+        spread  = sum_t ||theta_t - mean||^2, the total squared variation the
+                  average has to cancel. Zero means every snapshot was the same
+                  point, i.e. averaging is a mathematical no-op.
+        offset  = ||theta_T - mean||^2, scaled by alpha^2 this is exactly how far
+                  the returned model moves from the raw final iterate.
+        offset_ratio = offset / (count * spread). If it approaches 1 the window's
+                  variation is dominated by the final iterate's own offset rather
+                  than by movement between iterates, which is the regime where
+                  partial shrinkage has nothing to average.
+        """
+        if self.count == 0:
+            return None
+        params = [p for p in module.parameters() if p.requires_grad]
+        spread = 0.0
+        offset = 0.0
+        for acc, p, energy in zip(self.sums, params, self.energy):
+            mean = acc / self.count
+            mean_sq = float(torch.dot(mean.reshape(-1), mean.reshape(-1)))
+            # Clamp: the identity is exact in real arithmetic but energy and
+            # count*||mean||^2 are both ~1e8-scale fp32 accumulations.
+            spread += max(energy - self.count * mean_sq, 0.0)
+            host = p.detach().to(device="cpu", dtype=torch.float32)
+            diff = host - mean
+            offset += float(torch.dot(diff.reshape(-1), diff.reshape(-1)))
+        denom = self.count * spread
+        ratio = (offset / denom) if denom > 0.0 else float("inf")
+        return {
+            "count": self.count,
+            "spread": math.sqrt(spread),
+            "offset": math.sqrt(offset),
+            "offset_ratio": ratio,
+        }
+
+    def report(self, module=None):
+        line = (
+            f"tsa window: {self.count} snapshot(s) from step {self.first_step} to "
+            f"end, last at progress {self.last_progress:.4f}, "
+            f"window_frac={self.window_frac}"
+        )
+        if module is not None:
+            d = self.diagnostics(module)
+            if d is not None:
+                line += (
+                    f" | spread||theta_t - mean||={d['spread']:.6g} "
+                    f"||theta_T - mean||={d['offset']:.6g} "
+                    f"offset_ratio={d['offset_ratio']:.4g}"
+                )
+        return line
+
+
 def _run_training_once(runtime, tokenizer, config, device_batch_size, smoke_test):
     t_start = time.time()
     torch.manual_seed(42)
@@ -1134,7 +1281,7 @@ def _run_training_once(runtime, tokenizer, config, device_batch_size, smoke_test
         if progress < 1.0 - WARMDOWN_RATIO:
             return 1.0
         cooldown = (1.0 - progress) / WARMDOWN_RATIO
-        return cooldown * 1.0 + (1 - cooldown) * FINAL_LR_FRAC
+        return max(cooldown + (1 - cooldown) * FINAL_LR_FRAC, TERMINAL_FLOOR_FRAC)
 
     def get_muon_momentum(step):
         frac = min(step / 300, 1)
@@ -1145,6 +1292,17 @@ def _run_training_once(runtime, tokenizer, config, device_batch_size, smoke_test
 
     target_training_seconds = 10 if smoke_test else TIME_BUDGET
     max_steps = 3 if smoke_test else None
+
+    base_model = _unwrap_model(model)
+    averager = None
+    if TSA_ALPHA > 0.0:
+        averager = TerminalWindowAverager(base_model, TSA_WINDOW_FRAC)
+        print(
+            f"TSA enabled: alpha={TSA_ALPHA} window_frac={TSA_WINDOW_FRAC} "
+            f"(window opens at progress>={averager.threshold:.4f}, "
+            f"one snapshot per step)"
+        )
+    print(f"Terminal LR floor fraction: {TERMINAL_FLOOR_FRAC} (final_lr_frac={FINAL_LR_FRAC})")
 
     t_start_training = time.time()
     smooth_train_loss = 0.0
@@ -1210,6 +1368,13 @@ def _run_training_once(runtime, tokenizer, config, device_batch_size, smoke_test
         elif (step + 1) % 5000 == 0:
             gc.collect()
 
+        if averager is not None and averager.in_window(progress):
+            averager.snapshot(base_model, step, progress)
+            print(
+                f"tsa snapshot {averager.count} at step {step} "
+                f"progress={progress:.4f} lrm={lrm:.4f}"
+            )
+
         step += 1
         if max_steps is not None and step >= max_steps:
             break
@@ -1219,8 +1384,31 @@ def _run_training_once(runtime, tokenizer, config, device_batch_size, smoke_test
             break
 
     print()
+    tsa_diagnostics = None
+    if averager is not None:
+        # Computed here, before main() blends the parameters, because the
+        # diagnostic compares the raw final iterate against the window mean.
+        print(averager.report(base_model))
+        if averager.count == 0:
+            print(
+                "TSA WARNING: zero snapshots taken. progress never reached "
+                f"{averager.threshold:.4f}, so the blend would be a no-op. "
+                "This is expected under --smoke-test, where the loop exits after "
+                "3 steps before total_training_time advances."
+            )
+        else:
+            tsa_diagnostics = averager.diagnostics(base_model)
+            if tsa_diagnostics["offset_ratio"] > 1.0:
+                print(
+                    f"TSA NOTE: offset_ratio={tsa_diagnostics['offset_ratio']:.3g} > 1 means "
+                    "the final iterate's own distance from the window mean dominates the "
+                    "movement between iterates. Averaging has little to work with at this "
+                    "step count."
+                )
     return {
         "model": model,
+        "averager": averager,
+        "tsa_diagnostics": tsa_diagnostics,
         "num_params": num_params,
         "num_flops_per_token": num_flops_per_token,
         "total_training_time": total_training_time,
@@ -1327,6 +1515,18 @@ def main():
         return 1
 
     model = result["model"]
+    averager = result.get("averager")
+    tsa_applied = False
+    if averager is not None:
+        tsa_applied = averager.apply(_unwrap_model(model), TSA_ALPHA)
+        if tsa_applied:
+            print(
+                f"TSA applied: alpha={TSA_ALPHA} over {averager.count} snapshot(s) "
+                f"spanning {(averager.count - 1)} step(s) of {result['step']} total "
+                f"({100.0 * max(averager.count - 1, 0) / max(result['step'], 1):.1f}% of the run)"
+            )
+        else:
+            print("TSA not applied: alpha=0 or zero snapshots; returning the raw final iterate.")
     _save_pre_eval_checkpoint(model)
     model.eval()
 
@@ -1395,6 +1595,15 @@ def main():
     print(f"train_batch_size: {chosen_train_batch}")
     print(f"eval_batch_size:  {chosen_eval_batch}")
     print(f"activation_checkpointing: {'enabled' if chosen_checkpointing else 'disabled'}")
+    print(f"terminal_floor_frac: {TERMINAL_FLOOR_FRAC}")
+    print(f"tsa_alpha:          {TSA_ALPHA if tsa_applied else 0.0}")
+    print(f"tsa_snapshots:      {averager.count if averager is not None else 0}")
+    print(f"tsa_span_pct_run:   {100.0 * max((averager.count if averager is not None else 1) - 1, 0) / max(step, 1):.1f}")
+    if averager is not None and averager.count > 0 and result.get("tsa_diagnostics"):
+        d = result["tsa_diagnostics"]
+        print(f"tsa_spread:        {d['spread']:.6g}")
+        print(f"tsa_mean_offset:   {d['offset']:.6g}")
+        print(f"tsa_offset_ratio:  {d['offset_ratio']:.4g}")
     if args.smoke_test:
         print("smoke_test:       true")
     return 0
