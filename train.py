@@ -6,6 +6,7 @@ Usage: uv run train.py
 
 import argparse
 import gc
+import hashlib
 import json
 import os
 import platform
@@ -419,7 +420,54 @@ def _save_autotune_entries(path, entries):
         print(f"Warning: could not write autotune cache ({exc}).")
 
 
-def _make_autotune_cache_key(runtime):
+def _candidate_set_digest(train_candidates):
+    """Short stable fingerprint of the exact candidate list that was offered.
+
+    The candidate set is the thing the probe actually measured, so it belongs in
+    the key on its own terms: any edit to `_filter_train_batch_sizes`,
+    `_build_train_candidates` or the profile table changes what "the winner"
+    means, and without this a decision from the old resolver is still accepted
+    because it happens to be legal under the new one. That was the AUT-5 class of
+    bug, where a tier change inherited a batch size chosen for a different set.
+    """
+    payload = ";".join(
+        f"{batch_size}:{int(bool(checkpointing))}"
+        for batch_size, checkpointing in train_candidates
+    )
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()[:12]
+
+
+def _make_autotune_cache_key(runtime, vocab_size, train_candidates):
+    """Identity of the decision this run would cache, with nothing left unkeyed.
+
+    The key used to be the GPU, the torch build, the OS and `MAX_SEQ_LEN` only.
+    Everything that decides *how big the model is* was outside it, so a batch
+    size tuned for `n_layer=8 n_embd=512` was accepted unchanged by
+    `n_layer=24 n_embd=1536`: same card, same key, and the cached pair is legal
+    in the new profile's candidate set, so nothing rejected it. It either burned
+    a model build on the way to an OOM or, worse, fit and ran at a batch size
+    nobody chose, logged and compared like any other experiment.
+
+    Three things are now keyed, in order of how much of the failure they close:
+
+      - the resolved `GPTConfig`, not the knobs that produced it. `DEPTH`,
+        `ASPECT_RATIO`, `HEAD_DIM`, `WINDOW_PATTERN` and `vocab_size` are read
+        through `build_model_config`, the single resolver the probe and the run
+        share, so the key cannot drift from the shape that gets built if any of
+        those knobs is renamed, removed, or re-derived. `TOTAL_BATCH_SIZE` is
+        keyed directly because it fixes `grad_accum_steps`, and the Muon compute
+        dtype because it is the reason `740aa7f` had to exist -- probes that do
+        not model the real run are this bug's other half.
+      - the candidate list, digested, so the entry cannot outlive the resolver
+        that produced it.
+      - the pre-existing hardware and runtime fields.
+
+    This deliberately does not bump `AUTOTUNE_CACHE_VERSION`. A version bump
+    forces one re-probe and then leaves the same hole open for the next model
+    size change; changing the key makes every shape get its own entry, and the
+    old entries are already unreachable because their key strings do not match.
+    """
+    config = build_model_config(DEPTH, vocab_size, runtime)
     cc = f"{runtime.gpu_cc[0]}.{runtime.gpu_cc[1]}"
     return "|".join(
         [
@@ -429,6 +477,17 @@ def _make_autotune_cache_key(runtime):
             torch.__version__,
             platform.system(),
             str(MAX_SEQ_LEN),
+            f"depth={config.n_layer}",
+            f"n_embd={config.n_embd}",
+            f"n_head={config.n_head}",
+            f"n_kv_head={config.n_kv_head}",
+            f"vocab={config.vocab_size}",
+            f"window={config.window_pattern}",
+            f"backend={config.attention_backend}",
+            f"amp={config.compute_dtype}",
+            f"muon={MUON_COMPUTE_DTYPE}",
+            f"total_batch={TOTAL_BATCH_SIZE}",
+            f"candidates={_candidate_set_digest(train_candidates)}",
         ]
     )
 
@@ -1170,7 +1229,7 @@ def _autotune_train_candidate(runtime, tokenizer, vocab_size, train_candidates):
         return None
 
     cache_path = _get_autotune_cache_path()
-    cache_key = _make_autotune_cache_key(runtime)
+    cache_key = _make_autotune_cache_key(runtime, vocab_size, train_candidates)
     refresh_cache = os.environ.get("AUTORESEARCH_AUTOTUNE_REFRESH", "0") == "1"
     cache_entries = _load_autotune_entries(cache_path)
     device_free_bytes = _device_free_memory_bytes(runtime.gpu_name)
@@ -1182,15 +1241,19 @@ def _autotune_train_candidate(runtime, tokenizer, vocab_size, train_candidates):
             runtime, cache_entries.get(cache_key), train_candidates, budget_bytes, budget_basis
         )
         if cached_candidate is not None:
+            cached_config = build_model_config(DEPTH, vocab_size, runtime)
             print(
                 "Using cached autotune candidate: "
                 f"batch_size={cached_candidate[0]}, "
-                f"checkpointing={'on' if cached_candidate[1] else 'off'}."
+                f"checkpointing={'on' if cached_candidate[1] else 'off'} "
+                f"(tuned for n_layer={cached_config.n_layer} n_embd={cached_config.n_embd} "
+                f"vocab={cached_config.vocab_size} over {len(train_candidates)} candidates)."
             )
             cached_entry = cache_entries[cache_key]
             cached_rate = cached_entry.get("tok_per_sec")
             return {
                 "candidate": cached_candidate,
+                "cache_key": cache_key,
                 "tok_per_sec": cached_rate,
                 "peak_reserved_bytes": cached_entry.get("peak_reserved_bytes"),
                 # A cache hit only knows about the candidate it stored. If the run
@@ -1256,10 +1319,59 @@ def _autotune_train_candidate(runtime, tokenizer, vocab_size, train_candidates):
     )
     return {
         "candidate": best_candidate,
+        "cache_key": cache_key,
         "tok_per_sec": best_tok_per_sec,
         "peak_reserved_bytes": int(best_peak_reserved),
         "rates": rates,
     }
+
+
+def _invalidate_stale_autotune_entry(autotuned, chosen_candidate):
+    """Drop a cached decision that the real run has already contradicted.
+
+    The probe is a model of the run, not the run. When the run then abandons the
+    candidate the probe chose, the entry is known-wrong rather than merely
+    unverified, and leaving it in place means every later run tries the same
+    failing candidate first -- burning a model build each time, or, if the stale
+    candidate still fits, quietly running at a batch size nobody picked.
+
+    Deleting is the honest repair. The surviving candidate is a real result, but
+    the entry's `tok_per_sec` and `peak_reserved_bytes` belong to the candidate
+    that failed, and writing the new pair next to the old pair's measurements
+    would put a number in the file that was never measured. A re-probe costs one
+    autotune pass; a fabricated rate costs every later run's trust in the cache.
+
+    The entry is only removed if it still holds the probed candidate, so a
+    decision written by a later run is never clobbered by this one.
+    """
+    probed = (autotuned or {}).get("candidate")
+    cache_key = (autotuned or {}).get("cache_key")
+    if probed is None or not cache_key or chosen_candidate == probed:
+        return False
+
+    cache_path = _get_autotune_cache_path()
+    entries = _load_autotune_entries(cache_path)
+    entry = entries.get(cache_key)
+    if not isinstance(entry, dict):
+        return False
+    if (entry.get("train_batch_size"), entry.get("use_activation_checkpointing")) != probed:
+        return False
+
+    entries.pop(cache_key)
+    _save_autotune_entries(cache_path, entries)
+    if chosen_candidate is None:
+        outcome = "no candidate completed the run"
+    else:
+        outcome = (
+            f"the run used batch_size={chosen_candidate[0]}, "
+            f"checkpointing={'on' if chosen_candidate[1] else 'off'}"
+        )
+    print(
+        f"Dropped autotune cache entry: probed candidate batch_size={probed[0]}, "
+        f"checkpointing={'on' if probed[1] else 'off'} did not survive the real run "
+        f"({outcome}). The next run re-probes."
+    )
+    return True
 
 
 def _prioritize_autotuned_candidate(train_candidates, autotuned_candidate, prefer_small_batch=False):
@@ -1582,6 +1694,13 @@ def main():
             _restore_gc_after_attempt()
             print(str(exc))
             return 1
+
+    # The probe's pick has now either been used or been contradicted by the run.
+    # A contradicted entry is deleted so the next run does not lead with it again.
+    chosen_candidate = None
+    if result is not None:
+        chosen_candidate = (chosen_train_batch, chosen_checkpointing)
+    _invalidate_stale_autotune_entry(autotuned, chosen_candidate)
 
     if result is None:
         for reason in untrustworthy_reasons:
