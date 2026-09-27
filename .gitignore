@@ -23,3 +23,7 @@ dev/
 
 # Locally materialized model exports; they can be uploaded to Hugging Face.
 artifacts/
+
+# Per-run artifacts (results.tsv is tracked on purpose)
+*.pt
+run.log
