@@ -11,10 +11,17 @@ both the shipped MUON_COMPUTE_DTYPE and fp32, and asserts:
 
   1. ns_steps at or below the cap is accepted and the iteration count is honoured
   2. ns_steps above the cap raises instead of silently truncating
-  3. without the guard, ns_steps=8 is bit-identical to ns_steps=5 -- the regression
-     this guard exists to make impossible to record as an experiment
+  3. with the guard neutralised, ns_steps=8 is bit-identical to ns_steps=5 on the
+     shipped function itself -- the regression this guard exists to make impossible
+     to record as an experiment
   4. the shipped default equals len(polar_express_coeffs), so the default is the cap
      rather than an arbitrary number that happens to fit
+  5. setup_optimizer routes the value through the guard and still owns every
+     parameter exactly once
+
+Point 3 is deliberately done with the guard patched out rather than against a
+hand-copied copy of the iteration, so "bit-identical" is a statement about the code
+that ships and not about a re-implementation of it.
 
 CPU only, no dataset, no CUDA, no optimizer state: the iteration is a pure function
 of (grad, ns_steps).
@@ -61,7 +68,12 @@ def _drive(grads, ns_steps, red_dim):
 
 
 def _raw_ns(X, ns_steps):
-    """The iteration exactly as train.py runs it, so the pre-guard behaviour is testable."""
+    """The iteration with no guard at all, for a second opinion on the truncation.
+
+    Kept as a cross-check rather than the primary evidence: the primary evidence is
+    test_unpatched_iteration_would_have_be_a_no_op, which neutralises the guard on the
+    real muon_step_fused instead of re-implementing it.
+    """
     if X.size(-2) > X.size(-1):
         for a, b, c in polar_express_coeffs[:ns_steps]:
             A = X.mT @ X
@@ -126,17 +138,28 @@ class TestPolarExpressSchedule(unittest.TestCase):
 
     def test_unpatched_iteration_would_have_been_a_no_op(self):
         # The regression itself, stated as a fact about the shipped coefficient list:
-        # without assert_ns_steps_available, ns_steps=8 cannot differ from ns_steps=5.
-        for dtype in (torch.float32, MUON_COMPUTE_DTYPE):
-            for shape in SHAPES:
-                torch.manual_seed(0)
-                g = torch.randn(shape, dtype=dtype)
-                base = g / (g.norm(dim=(-2, -1), keepdim=True) * 1.02 + 1e-6)
-                k = POLAR_EXPRESS_MAX_STEPS
-                self.assertTrue(
-                    torch.equal(_raw_ns(base.clone(), k + 3), _raw_ns(base.clone(), k)),
-                    f"ns_steps={k + 3} was expected to truncate to {k} at {shape}/{dtype}",
-                )
+        # with the guard neutralised, ns_steps=8 cannot differ from ns_steps=5. This is the
+        # assertion that makes the fix load-bearing -- without it, "bit-identical" would be
+        # a claim about a re-implementation of the loop rather than about the code that runs.
+        import unittest.mock as mock
+        with mock.patch.object(train, "assert_ns_steps_available", lambda n: None):
+            for dtype in (torch.float32, MUON_COMPUTE_DTYPE):
+                for shape in SHAPES:
+                    torch.manual_seed(0)
+                    grads = torch.randn((STACK,) + shape, dtype=dtype)
+                    red_dim = -1 if shape[0] >= shape[1] else -2
+                    k = POLAR_EXPRESS_MAX_STEPS
+                    self.assertTrue(
+                        torch.equal(_drive(grads, k + 3, red_dim), _drive(grads, k, red_dim)),
+                        f"ns_steps={k + 3} was expected to truncate to {k} "
+                        f"at {shape}/{dtype}",
+                    )
+
+    def test_coefficient_schedule_itself_truncates(self):
+        # The mechanism, stated directly on the list: five triples, so the slice cannot
+        # yield more than five. Independent of the guard and of muon_step_fused.
+        self.assertEqual(len(polar_express_coeffs), 5)
+        self.assertEqual(len(polar_express_coeffs[:8]), len(polar_express_coeffs))
 
     def test_update_is_finite_and_moves(self):
         for dtype in (torch.float32, MUON_COMPUTE_DTYPE):
