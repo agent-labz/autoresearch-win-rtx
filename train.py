@@ -9,6 +9,7 @@ import gc
 import json
 import os
 import platform
+import subprocess
 import time
 from dataclasses import asdict, dataclass
 from pathlib import Path
@@ -34,6 +35,18 @@ from prepare import (
 # ---------------------------------------------------------------------------
 # Runtime configuration
 # ---------------------------------------------------------------------------
+
+
+class GpuRunNotTrustworthyError(RuntimeError):
+    """The device is not delivering VRAM at the rate this config was probed at.
+
+    On WDDM an allocation that does not fit is served from shared system memory
+    instead of raising `OutOfMemoryError`. The run therefore keeps going and keeps
+    producing a `val_bpb` at a small fraction of its normal speed, which is a
+    hardware limit that would otherwise be logged as a legitimate experimental
+    result. This is its own type so the candidate loop can drop to a smaller
+    batch instead of treating it as a hard failure.
+    """
 
 
 @dataclass
@@ -80,7 +93,19 @@ VRAM_REPORTING_TOLERANCE_GB = 0.25
 AUTOTUNE_MEASURE_TOKENS = 131072
 AUTOTUNE_MIN_MEASURE_MICRO_STEPS = 4
 AUTOTUNE_MAX_MEMORY_FRACTION = 0.90
-AUTOTUNE_CACHE_VERSION = "gpu-profile-v3"
+AUTOTUNE_CACHE_VERSION = "gpu-profile-v4"
+DEVICE_QUERY_TIMEOUT_S = 5.0
+RUN_MIN_THROUGHPUT_RATIO = 0.34
+RUN_SLOW_STEP_LIMIT = 3
+# 0, not 11: the run is flat from its first step on this model (measured 47,856
+# tok/sec at step 0 against 47,846 at step 7 on an idle card), and a spilling
+# candidate is slow exactly at the start, while the allocator is still growing
+# into shared memory -- measured 7,687 / 7,730 / 8,177 tok/sec at steps 0-2
+# against a 47,443 tok/sec probe for the same candidate. A warmup allowance
+# would have started checking after the damage.
+RUN_RATE_CHECK_START_STEP = 0
+CONTENTION_WARN_FRACTION = 0.10
+CONTENTION_SAMPLE_EVERY = 25
 
 
 def _get_gpu_peak_flops(gpu_name):
@@ -225,6 +250,148 @@ def _get_autotune_cache_path():
     else:
         base = Path.home() / ".cache"
     return base / "autoresearch" / f"{AUTOTUNE_CACHE_VERSION}.json"
+
+
+# ---------------------------------------------------------------------------
+# Device-wide VRAM accounting
+#
+# `torch.cuda.mem_get_info()` is NOT usable for this on WDDM. Measured on this
+# box: a fresh process reported free = 15,951,986,688 B whether or not another
+# process held 10 GiB on the card, while `nvidia-smi` correctly reported
+# 5,266 MiB free instead of 15,633 MiB. Under WDDM it is a per-process view, so
+# it cannot see the other experimenter -- which is the only thing a memory gate
+# on this card needs to know. Only the driver sees device-wide usage, so the
+# driver is what we ask, and every caller falls back to the total-based ceiling
+# when the query is unavailable.
+# ---------------------------------------------------------------------------
+
+
+def _device_free_memory_bytes(gpu_name):
+    """Bytes free on the whole device, or None if the driver cannot be asked.
+
+    Returns None rather than guessing: an unavailable query must degrade to the
+    physical ceiling, never to a number that looks like free memory and is not.
+    """
+    try:
+        completed = subprocess.run(
+            [
+                "nvidia-smi",
+                "--query-gpu=name,memory.free",
+                "--format=csv,noheader,nounits",
+            ],
+            capture_output=True,
+            text=True,
+            timeout=DEVICE_QUERY_TIMEOUT_S,
+            check=True,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return None
+
+    matches = []
+    for line in completed.stdout.splitlines():
+        fields = [field.strip() for field in line.split(",")]
+        if len(fields) != 2 or not fields[1].isdigit():
+            continue
+        matches.append((fields[0], int(fields[1])))
+    if not matches:
+        return None
+    if len(matches) == 1:
+        return matches[0][1] * 1024 * 1024
+    for name, free_mib in matches:
+        if name == gpu_name:
+            return free_mib * 1024 * 1024
+    return None
+
+
+def _memory_budget_bytes(runtime, device_free_bytes):
+    """Bytes this process may commit, and which reading the budget came from.
+
+    The fraction is unchanged from the shipped gate; only the numerator's
+    meaning is. `total` is a property of the card and is always readable, so it
+    stays as the floor of the decision. Device-wide free memory is the honest
+    quantity when it is available, and is clamped to total because a driver
+    cannot report more free than the card physically has.
+    """
+    total = runtime.gpu_total_memory_bytes
+    if device_free_bytes is None:
+        return total * AUTOTUNE_MAX_MEMORY_FRACTION, "total VRAM"
+    basis = min(device_free_bytes, total)
+    return basis * AUTOTUNE_MAX_MEMORY_FRACTION, "device-wide free VRAM"
+
+
+def _memory_gate_rejection(runtime, peak_reserved_bytes, budget_bytes, budget_basis):
+    """Why a candidate must be rejected on memory grounds, or None to accept it.
+
+    Returns the reason without any prefix of its own, because the probe and the
+    cache validator both report it and they are not the same kind of event.
+
+    Two tests, in order. The first is a statement about physics: no process can
+    hold more VRAM than the card has, so a peak above the card's own total means
+    the driver served the excess from shared system memory. The second is a
+    statement about the moment: the candidate has to fit in what is free now.
+    """
+    total = runtime.gpu_total_memory_bytes
+    if peak_reserved_bytes > total:
+        return (
+            f"committed {peak_reserved_bytes / 1024**3:.2f} GiB, more than the card's "
+            f"{total / 1024**3:.2f} GiB. The driver served the excess from shared system "
+            "memory, so this candidate is slower, not larger."
+        )
+    if peak_reserved_bytes > budget_bytes:
+        return (
+            f"committed {peak_reserved_bytes / 1024**3:.2f} GiB, over the "
+            f"{budget_bytes / 1024**3:.2f} GiB budget "
+            f"({AUTOTUNE_MAX_MEMORY_FRACTION:.0%} of {budget_basis})."
+        )
+    return None
+
+
+def _cached_candidate(runtime, cached, train_candidates, budget_bytes, budget_basis):
+    """Pick a usable candidate out of a cache entry, or return (None, reason).
+
+    A cache hit is the common path and it re-measures nothing, so it has to be
+    re-checked against the card as it is now: a batch size that fit when the
+    entry was written does not fit once another process takes the memory, and
+    with the shipped gate nothing downstream would notice.
+    """
+    if not isinstance(cached, dict):
+        return None, "entry is not an object"
+    batch_size = cached.get("train_batch_size")
+    checkpointing = cached.get("use_activation_checkpointing")
+    if not isinstance(batch_size, int) or not isinstance(checkpointing, bool):
+        return None, "entry has no usable candidate fields"
+    candidate = (batch_size, checkpointing)
+    if candidate not in train_candidates:
+        return None, f"candidate {candidate} is not in this profile's candidate set"
+    peak_reserved = cached.get("peak_reserved_bytes")
+    if not isinstance(peak_reserved, int):
+        return None, "entry records no committed-memory high-water mark"
+    rejection = _memory_gate_rejection(runtime, peak_reserved, budget_bytes, budget_basis)
+    if rejection is not None:
+        return None, rejection
+    return candidate, None
+
+
+def _report_device_contention(runtime, device_free_bytes, prefix=""):
+    total = runtime.gpu_total_memory_bytes
+    if device_free_bytes is None:
+        print(
+            f"{prefix}Device free VRAM: unknown (driver query unavailable); "
+            "memory decisions fall back to total VRAM."
+        )
+        return
+    held = total - device_free_bytes
+    print(
+        f"{prefix}Device VRAM: {device_free_bytes / 1024**3:.2f} GiB free of "
+        f"{total / 1024**3:.2f} GiB ({held / 1024**3:.2f} GiB held elsewhere)"
+    )
+    if held > CONTENTION_WARN_FRACTION * total:
+        print(
+            f"{prefix}WARNING: another process is holding {held / 1024**3:.2f} GiB of this "
+            f"{total / 1024**3:.2f} GiB card. Results measured now are not comparable to a "
+            "solo run, and on Windows an allocation that does not fit spills into shared "
+            "memory instead of failing."
+        )
 
 
 def _load_autotune_entries(path):
@@ -944,6 +1111,8 @@ def _benchmark_train_candidate(runtime, tokenizer, vocab_size, train_batch_size,
         )
         x, y, _ = next(train_loader)
         torch.cuda.empty_cache()
+        device_free_bytes = _device_free_memory_bytes(runtime.gpu_name)
+        budget_bytes, budget_basis = _memory_budget_bytes(runtime, device_free_bytes)
 
         def run_micro_steps(count):
             nonlocal x, y
@@ -965,12 +1134,20 @@ def _benchmark_train_candidate(runtime, tokenizer, vocab_size, train_batch_size,
         model.zero_grad(set_to_none=True)
 
         peak_memory = torch.cuda.max_memory_allocated()
-        peak_limit = runtime.gpu_total_memory_bytes * AUTOTUNE_MAX_MEMORY_FRACTION
-        if peak_memory > peak_limit:
+        # `reserved` is what the caching allocator actually took from the driver.
+        # `allocated` understates it by the allocator's cached blocks and
+        # fragmentation -- measured 9,874 MB allocated vs 12,700 MB reserved at
+        # batch 32 with checkpointing on, a 2.8 GB gap. That gap is exactly what
+        # tips a candidate into spilling on a contended card, so the budget is
+        # compared against `reserved`.
+        peak_reserved = torch.cuda.max_memory_reserved()
+        rejection = _memory_gate_rejection(runtime, peak_reserved, budget_bytes, budget_basis)
+        if rejection is not None:
+            print(f"Autotune candidate rejected: {rejection}")
             return None
         tokens_measured = measure_micro_steps * tokens_per_micro_step
         tok_per_sec = tokens_measured / max(measured_time, 1e-6)
-        return tok_per_sec, peak_memory
+        return tok_per_sec, peak_memory, peak_reserved
     except torch.cuda.OutOfMemoryError:
         return None
     except RuntimeError as exc:
@@ -996,26 +1173,40 @@ def _autotune_train_candidate(runtime, tokenizer, vocab_size, train_candidates):
     cache_key = _make_autotune_cache_key(runtime)
     refresh_cache = os.environ.get("AUTORESEARCH_AUTOTUNE_REFRESH", "0") == "1"
     cache_entries = _load_autotune_entries(cache_path)
+    device_free_bytes = _device_free_memory_bytes(runtime.gpu_name)
+    budget_bytes, budget_basis = _memory_budget_bytes(runtime, device_free_bytes)
     if refresh_cache:
         print("Autotune cache refresh requested by AUTORESEARCH_AUTOTUNE_REFRESH=1.")
     else:
-        cached = cache_entries.get(cache_key)
-        if isinstance(cached, dict):
-            cached_batch_size = cached.get("train_batch_size")
-            cached_checkpointing = cached.get("use_activation_checkpointing")
-            if isinstance(cached_batch_size, int) and isinstance(cached_checkpointing, bool):
-                cached_candidate = (cached_batch_size, cached_checkpointing)
-                if cached_candidate in train_candidates:
-                    print(
-                        "Using cached autotune candidate: "
-                        f"batch_size={cached_batch_size}, checkpointing={'on' if cached_checkpointing else 'off'}."
-                    )
-                    return cached_candidate
+        cached_candidate, cached_reason = _cached_candidate(
+            runtime, cache_entries.get(cache_key), train_candidates, budget_bytes, budget_basis
+        )
+        if cached_candidate is not None:
+            print(
+                "Using cached autotune candidate: "
+                f"batch_size={cached_candidate[0]}, "
+                f"checkpointing={'on' if cached_candidate[1] else 'off'}."
+            )
+            cached_entry = cache_entries[cache_key]
+            cached_rate = cached_entry.get("tok_per_sec")
+            return {
+                "candidate": cached_candidate,
+                "tok_per_sec": cached_rate,
+                "peak_reserved_bytes": cached_entry.get("peak_reserved_bytes"),
+                # A cache hit only knows about the candidate it stored. If the run
+                # falls through to a different candidate there is no rate to check
+                # it against, so that candidate runs on the physical ceiling alone.
+                "rates": {cached_candidate: cached_rate} if isinstance(cached_rate, (int, float)) else {},
+            }
+        if cache_entries.get(cache_key) is not None:
+            print(f"Ignoring cached autotune candidate: {cached_reason}.")
 
     print("Running consumer GPU autotune in eager mode...")
     best_candidate = None
     best_tok_per_sec = -1.0
     best_peak_memory = 0
+    best_peak_reserved = 0
+    rates = {}
     for train_batch_size, use_checkpointing in train_candidates:
         ckpt_label = "on" if use_checkpointing else "off"
         print(f"Autotune probe: train_batch_size={train_batch_size}, checkpointing={ckpt_label}")
@@ -1027,14 +1218,23 @@ def _autotune_train_candidate(runtime, tokenizer, vocab_size, train_candidates):
             use_checkpointing=use_checkpointing,
         )
         if result is None:
-            print("  rejected (OOM, runtime error, or >90% VRAM use)")
+            print("  rejected (OOM, runtime error, or over the memory budget)")
             continue
-        tok_per_sec, peak_memory = result
-        print(f"  accepted: tok/sec={tok_per_sec:,.0f}, peak_vram_mb={peak_memory / 1024 / 1024:.1f}")
+        tok_per_sec, peak_memory, peak_reserved = result
+        print(
+            f"  accepted: tok/sec={tok_per_sec:,.0f}, "
+            f"peak_vram_mb={peak_memory / 1024 / 1024:.1f}, "
+            f"committed_mb={peak_reserved / 1024 / 1024:.1f}"
+        )
+        # Every accepted candidate's own rate, so a run that falls through to a
+        # different candidate is checked against that candidate's rate and not
+        # against the winner's.
+        rates[(train_batch_size, use_checkpointing)] = tok_per_sec
         if tok_per_sec > best_tok_per_sec:
             best_tok_per_sec = tok_per_sec
             best_candidate = (train_batch_size, use_checkpointing)
             best_peak_memory = peak_memory
+            best_peak_reserved = peak_reserved
 
     if best_candidate is None:
         print("Autotune could not find a viable candidate; using default fallback ordering.")
@@ -1045,6 +1245,8 @@ def _autotune_train_candidate(runtime, tokenizer, vocab_size, train_candidates):
         "use_activation_checkpointing": best_candidate[1],
         "tok_per_sec": round(best_tok_per_sec, 3),
         "peak_memory_bytes": int(best_peak_memory),
+        "peak_reserved_bytes": int(best_peak_reserved),
+        "device_free_bytes_at_tune": int(device_free_bytes) if device_free_bytes else None,
         "updated_unix": int(time.time()),
     }
     _save_autotune_entries(cache_path, cache_entries)
@@ -1052,7 +1254,12 @@ def _autotune_train_candidate(runtime, tokenizer, vocab_size, train_candidates):
         "Autotune selected candidate: "
         f"batch_size={best_candidate[0]}, checkpointing={'on' if best_candidate[1] else 'off'}."
     )
-    return best_candidate
+    return {
+        "candidate": best_candidate,
+        "tok_per_sec": best_tok_per_sec,
+        "peak_reserved_bytes": int(best_peak_reserved),
+        "rates": rates,
+    }
 
 
 def _prioritize_autotuned_candidate(train_candidates, autotuned_candidate, prefer_small_batch=False):
@@ -1082,7 +1289,7 @@ def _configure_step_kernels(runtime):
     USE_COMPILE = False
 
 
-def _run_training_once(runtime, tokenizer, config, device_batch_size, smoke_test):
+def _run_training_once(runtime, tokenizer, config, device_batch_size, smoke_test, reference_tok_per_sec=None):
     t_start = time.time()
     torch.manual_seed(42)
     torch.cuda.manual_seed(42)
@@ -1150,6 +1357,13 @@ def _run_training_once(runtime, tokenizer, config, device_batch_size, smoke_test
     smooth_train_loss = 0.0
     total_training_time = 0.0
     step = 0
+    slow_steps = 0
+    lowest_free_bytes = _device_free_memory_bytes(runtime.gpu_name)
+    if reference_tok_per_sec:
+        print(
+            f"Rate guard armed: aborting if {RUN_SLOW_STEP_LIMIT} consecutive steps fall below "
+            f"{RUN_MIN_THROUGHPUT_RATIO:.0%} of the probed {reference_tok_per_sec:,.0f} tok/sec."
+        )
 
     while True:
         torch.cuda.synchronize()
@@ -1183,6 +1397,39 @@ def _run_training_once(runtime, tokenizer, config, device_batch_size, smoke_test
         dt = t1 - t0
         if step > 10:
             total_training_time += dt
+
+        # Two ways the device stops delivering VRAM, both of which would
+        # otherwise end in a number that looks like a result. Neither needs to
+        # know what another process is doing.
+        committed = torch.cuda.max_memory_reserved()
+        if committed > runtime.gpu_total_memory_bytes:
+            raise GpuRunNotTrustworthyError(
+                f"step {step}: committed {committed / 1024**3:.2f} GiB of VRAM, more than the "
+                f"card's {runtime.gpu_total_memory_bytes / 1024**3:.2f} GiB. The driver is serving "
+                "this run from shared system memory, so the run is slower, not smaller, and its "
+                "val_bpb would not be comparable to an uncontended one."
+            )
+        # Contention can appear after startup, so the reading at startup is not
+        # enough on its own: sample during the run and keep the worst. Offset by
+        # one so the reading taken before the loop is not repeated at step 0.
+        if (step + 1) % CONTENTION_SAMPLE_EVERY == 0:
+            free_now = _device_free_memory_bytes(runtime.gpu_name)
+            if free_now is not None and (lowest_free_bytes is None or free_now < lowest_free_bytes):
+                lowest_free_bytes = free_now
+        if reference_tok_per_sec and step >= RUN_RATE_CHECK_START_STEP:
+            measured_tok_per_sec = TOTAL_BATCH_SIZE / max(dt, 1e-6)
+            if measured_tok_per_sec < RUN_MIN_THROUGHPUT_RATIO * reference_tok_per_sec:
+                slow_steps += 1
+                if slow_steps >= RUN_SLOW_STEP_LIMIT:
+                    raise GpuRunNotTrustworthyError(
+                        f"step {step}: {measured_tok_per_sec:,.0f} tok/sec against a probed "
+                        f"{reference_tok_per_sec:,.0f} tok/sec for this exact candidate "
+                        f"({RUN_SLOW_STEP_LIMIT} consecutive steps below "
+                        f"{RUN_MIN_THROUGHPUT_RATIO:.0%} of it). Another process is most likely on "
+                        "the card. Refusing to produce a val_bpb for a contended run."
+                    )
+            else:
+                slow_steps = 0
 
         ema_beta = 0.9
         smooth_train_loss = ema_beta * smooth_train_loss + (1 - ema_beta) * train_loss_f
@@ -1227,6 +1474,7 @@ def _run_training_once(runtime, tokenizer, config, device_batch_size, smoke_test
         "step": step,
         "t_start": t_start,
         "t_start_training": t_start_training,
+        "lowest_free_memory_bytes": lowest_free_bytes,
     }
 
 
@@ -1262,6 +1510,7 @@ def main():
     print(f"Consumer matrix support: {'yes' if runtime.gpu_profile.is_supported_consumer else 'compatibility path'}")
     print(f"TF32: {'enabled' if runtime.tf32_enabled else 'disabled'}")
     print(f"AMP dtype: {runtime.amp_dtype}")
+    _report_device_contention(runtime, _device_free_memory_bytes(runtime.gpu_name))
 
     tokenizer = Tokenizer.from_directory(dataset=args.dataset)
     vocab_size = tokenizer.get_vocab_size()
@@ -1272,7 +1521,9 @@ def main():
     _configure_step_kernels(runtime)
 
     train_candidates = _build_train_candidates(runtime)
-    autotuned_candidate = _autotune_train_candidate(runtime, tokenizer, vocab_size, train_candidates)
+    autotuned = _autotune_train_candidate(runtime, tokenizer, vocab_size, train_candidates)
+    autotuned_candidate = autotuned["candidate"] if autotuned else None
+    autotuned_rates = autotuned["rates"] if autotuned else {}
     train_candidates = _prioritize_autotuned_candidate(
         train_candidates,
         autotuned_candidate,
@@ -1285,6 +1536,7 @@ def main():
     result = None
     chosen_train_batch = None
     chosen_checkpointing = None
+    untrustworthy_reasons = []
     for train_batch_size, use_checkpointing in train_candidates:
         config = build_model_config(
             DEPTH,
@@ -1298,6 +1550,9 @@ def main():
             f"activation_checkpointing={'enabled' if use_checkpointing else 'disabled'}"
         )
         print(f"Model config: {asdict(config)}")
+        # This candidate's own probed rate, not the winner's: the loop falls
+        # through to different candidates when one is abandoned.
+        reference_tok_per_sec = autotuned_rates.get((train_batch_size, use_checkpointing))
         try:
             result = _run_training_once(
                 runtime=runtime,
@@ -1305,10 +1560,16 @@ def main():
                 config=config,
                 device_batch_size=train_batch_size,
                 smoke_test=args.smoke_test,
+                reference_tok_per_sec=reference_tok_per_sec,
             )
             chosen_train_batch = train_batch_size
             chosen_checkpointing = use_checkpointing
             break
+        except GpuRunNotTrustworthyError as exc:
+            untrustworthy_reasons.append(str(exc))
+            print(f"Abandoned candidate: {exc}")
+            torch.cuda.empty_cache()
+            _restore_gc_after_attempt()
         except torch.cuda.OutOfMemoryError:
             print(
                 "Train OOM at "
@@ -1323,6 +1584,8 @@ def main():
             return 1
 
     if result is None:
+        for reason in untrustworthy_reasons:
+            print(f"FAIL: {reason}")
         print("FAIL: training failed for all batch size candidates.")
         return 1
 
@@ -1395,6 +1658,18 @@ def main():
     print(f"train_batch_size: {chosen_train_batch}")
     print(f"eval_batch_size:  {chosen_eval_batch}")
     print(f"activation_checkpointing: {'enabled' if chosen_checkpointing else 'disabled'}")
+    # Repeated next to val_bpb so a contended run cannot be logged as a clean one
+    # by grepping for the metric alone.
+    _report_device_contention(
+        runtime,
+        result.get("lowest_free_memory_bytes"),
+        prefix="(worst seen during training) ",
+    )
+    _report_device_contention(
+        runtime,
+        _device_free_memory_bytes(runtime.gpu_name),
+        prefix="(at completion) ",
+    )
     if args.smoke_test:
         print("smoke_test:       true")
     return 0
