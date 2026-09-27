@@ -53,6 +53,7 @@ total_tokens_M:   499.6
 num_steps:        953
 num_params_M:     50.3
 depth:            8
+eval_tokens:      4194304
 ```
 
 Note that the script is configured to always stop after 5 minutes, so depending on the computing platform of this computer the numbers might look different. You can extract the key metric from the log file:
@@ -61,30 +62,37 @@ Note that the script is configured to always stop after 5 minutes, so depending 
 grep "^val_bpb:" run.log
 ```
 
+`eval_tokens` is the validation budget the run actually scored. It is a fixed program
+definition, not a knob: the eval stream is packed best-fit, so it covers 96.30% of the val
+documents at 4,194,304 tokens with the tails of long documents dropped. `val_bpb` is therefore
+bits per byte over that subset, not over the validation set, and it is only comparable to other
+`val_bpb` values logged at the same `eval_tokens`. Log it in every row.
+
 ## Logging results
 
 When an experiment is done, log it to `results.tsv` (tab-separated, NOT comma-separated — commas break in descriptions).
 
-The TSV has a header row and 5 columns:
+The TSV has a header row and 6 columns:
 
 ```
-commit	val_bpb	memory_gb	status	description
+commit	val_bpb	memory_gb	status	eval_tokens	description
 ```
 
 1. git commit hash (short, 7 chars)
 2. val_bpb achieved (e.g. 1.234567) — use 0.000000 for crashes
 3. peak memory in GB, round to .1f (e.g. 12.3 — divide peak_vram_mb by 1024) — use 0.0 for crashes
 4. status: `keep`, `discard`, or `crash`
-5. short text description of what this experiment tried
+5. eval_tokens scored, from the run summary — use 0 for crashes
+6. short text description of what this experiment tried
 
 Example:
 
 ```
-commit	val_bpb	memory_gb	status	description
-a1b2c3d	0.997900	44.0	keep	baseline
-b2c3d4e	0.993200	44.2	keep	increase LR to 0.04
-c3d4e5f	1.005000	44.0	discard	switch to GeLU activation
-d4e5f6g	0.000000	0.0	crash	double model width (OOM)
+commit	val_bpb	memory_gb	status	eval_tokens	description
+a1b2c3d	0.997900	44.0	keep	4194304	baseline
+b2c3d4e	0.993200	44.2	keep	4194304	increase LR to 0.04
+c3d4e5f	1.005000	44.0	discard	4194304	switch to GeLU activation
+d4e5f6g	0.000000	0.0	crash	0	double model width (OOM)
 ```
 
 ## The experiment loop

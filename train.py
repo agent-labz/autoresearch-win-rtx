@@ -24,7 +24,6 @@ from torch.utils.checkpoint import checkpoint as torch_checkpoint
 
 from prepare import (
     DATASET_CHOICES,
-    EVAL_TOKENS,
     MAX_SEQ_LEN,
     TIME_BUDGET,
     Tokenizer,
@@ -854,6 +853,8 @@ TERMINAL_FLOOR_FRAC = 0.0
 DEPTH = 8
 DEVICE_BATCH_SIZE = 16
 EVAL_BATCH_SIZE = 8
+# AUT-32: 2^22 = 2,048 rows, 96.30% of the val documents
+EVAL_BUDGET_TOKENS = 8 * 524288
 
 
 def build_model_config(depth, vocab_size, runtime, use_activation_checkpointing=None):
@@ -1530,7 +1531,8 @@ def main():
     _save_pre_eval_checkpoint(model)
     model.eval()
 
-    eval_tokens = max(MAX_SEQ_LEN * chosen_train_batch * 2, 8192) if args.smoke_test else EVAL_TOKENS
+    eval_tokens = (max(MAX_SEQ_LEN * chosen_train_batch * 2, 8192)
+                   if args.smoke_test else EVAL_BUDGET_TOKENS)
     val_bpb = None
     chosen_eval_batch = None
     initial_eval_batch = min(chosen_train_batch, runtime.gpu_profile.eval_batch_cap)
@@ -1594,6 +1596,7 @@ def main():
     print(f"dataset:          {tokenizer.dataset}")
     print(f"train_batch_size: {chosen_train_batch}")
     print(f"eval_batch_size:  {chosen_eval_batch}")
+    print(f"eval_tokens:      {eval_tokens}")
     print(f"activation_checkpointing: {'enabled' if chosen_checkpointing else 'disabled'}")
     print(f"terminal_floor_frac: {TERMINAL_FLOOR_FRAC}")
     print(f"tsa_alpha:          {TSA_ALPHA if tsa_applied else 0.0}")
