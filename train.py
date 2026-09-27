@@ -46,7 +46,6 @@ from torch.utils.checkpoint import checkpoint as torch_checkpoint
 
 from prepare import (
     DATASET_CHOICES,
-    EVAL_TOKENS,
     MAX_SEQ_LEN,
     TIME_BUDGET,
     Tokenizer,
@@ -1069,6 +1068,8 @@ MOE_Z_LOSS_WEIGHT = 0.001
 DEPTH = 8
 DEVICE_BATCH_SIZE = 16
 EVAL_BATCH_SIZE = 8
+# AUT-32: 2^22 = 2,048 rows, 96.30% of the val documents
+EVAL_BUDGET_TOKENS = 8 * 524288
 
 
 def build_model_config(depth, vocab_size, runtime, use_activation_checkpointing=None, use_moe=False,
@@ -2160,7 +2161,8 @@ def main():
     _save_pre_eval_checkpoint(model)
     model.eval()
 
-    eval_tokens = max(MAX_SEQ_LEN * chosen_train_batch * 2, 8192) if args.smoke_test else EVAL_TOKENS
+    eval_tokens = (max(MAX_SEQ_LEN * chosen_train_batch * 2, 8192)
+                   if args.smoke_test else EVAL_BUDGET_TOKENS)
     val_bpb = None
     chosen_eval_batch = None
     initial_eval_batch = min(chosen_train_batch, runtime.gpu_profile.eval_batch_cap)
@@ -2291,6 +2293,7 @@ def main():
     print(f"tokenizer_dataset: {tokenizer.dataset}")
     print(f"train_batch_size: {chosen_train_batch}")
     print(f"eval_batch_size:  {chosen_eval_batch}")
+    print(f"eval_tokens:      {eval_tokens}")
     print(f"activation_checkpointing: {'enabled' if chosen_checkpointing else 'disabled'}")
     if selected_config.use_moe:
         print(f"use_moe:          enabled")
