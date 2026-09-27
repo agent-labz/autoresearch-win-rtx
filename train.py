@@ -11,6 +11,7 @@ import math
 import os
 import platform
 import time
+import traceback
 from dataclasses import asdict, dataclass
 from pathlib import Path
 
@@ -80,7 +81,9 @@ VRAM_REPORTING_TOLERANCE_GB = 0.25
 AUTOTUNE_MEASURE_TOKENS = 131072
 AUTOTUNE_MIN_MEASURE_MICRO_STEPS = 4
 AUTOTUNE_MAX_MEMORY_FRACTION = 0.90
-AUTOTUNE_CACHE_VERSION = "gpu-profile-v3"
+# v4 records per-candidate probe error signatures in the autotune cache, so a
+# candidate chosen while probes were erroring cannot be reused silently.
+AUTOTUNE_CACHE_VERSION = "gpu-profile-v4"
 
 
 def _get_gpu_peak_flops(gpu_name):
@@ -1069,6 +1072,142 @@ def _build_eval_batch_candidates(train_batch_size, initial_eval_batch):
     return deduped
 
 
+# ---------------------------------------------------------------------------
+# Autotune probe outcome classification
+# ---------------------------------------------------------------------------
+# A rejected autotune candidate has two very different causes and they must not
+# be reported the same way. A capacity rejection (the GPU genuinely could not
+# fit the shape) is expected and quiet. A probe error (a shape mismatch, a NaN,
+# a device-side assert, a bug in the model) is a code defect that used to be
+# printed as though it were a hardware limit, silently narrowing the candidate
+# set and caching a worse train_batch_size for every later run.
+
+PROBE_ACCEPTED = "accepted"
+PROBE_OUT_OF_MEMORY = "out_of_memory"
+PROBE_VRAM_LIMIT = "vram_limit"
+PROBE_ERROR = "error"
+
+# Narrow on purpose. "failed to allocate" and "alloc failed" are excluded: the
+# torch messages "Failed to allocate tensor with shape ..." describe a shape
+# error, which is a code bug and must not be filed as a capacity rejection.
+_OOM_MESSAGE_MARKERS = (
+    "out of memory",
+    "cublas_status_alloc_failed",
+    "cudaerrormemoryallocation",
+)
+
+
+@dataclass
+class _TrainProbeOutcome:
+    kind: str
+    train_batch_size: int
+    use_checkpointing: bool
+    tok_per_sec: float = 0.0
+    peak_memory_bytes: int = 0
+    detail: str = ""
+
+    @property
+    def is_accepted(self):
+        return self.kind == PROBE_ACCEPTED
+
+    @property
+    def is_capacity_rejection(self):
+        return self.kind in (PROBE_OUT_OF_MEMORY, PROBE_VRAM_LIMIT)
+
+    @property
+    def is_error(self):
+        return self.kind == PROBE_ERROR
+
+
+def _is_out_of_memory_exception(exc):
+    if isinstance(exc, torch.cuda.OutOfMemoryError):
+        return True
+    message = str(exc).lower()
+    return any(marker in message for marker in _OOM_MESSAGE_MARKERS)
+
+
+def _classify_probe_exception(exc):
+    """Bucket a probe failure by inspecting the exception, not by catching broadly."""
+    if _is_out_of_memory_exception(exc):
+        return PROBE_OUT_OF_MEMORY
+    return PROBE_ERROR
+
+
+def _format_probe_exception(exc):
+    return f"{type(exc).__name__}: {exc}".strip()
+
+
+def _probe_candidate_label(train_batch_size, use_checkpointing):
+    return f"batch_size={train_batch_size}, checkpointing={'on' if use_checkpointing else 'off'}"
+
+
+def _print_probe_error(outcome, traceback_text):
+    print(
+        "\n".join(
+            [
+                "",
+                "!" * 78,
+                "AUTOTUNE PROBE FAILED - this is a code error, not a VRAM limit.",
+                f"  candidate: {_probe_candidate_label(outcome.train_batch_size, outcome.use_checkpointing)}",
+                f"  exception: {outcome.detail}",
+                f"  traceback: {traceback_text}",
+                "  This candidate is NOT recorded as a capacity rejection. The autotune",
+                "  summary reports it separately and the cache entry records it so the",
+                "  failure resurfaces on later runs instead of staying silent.",
+                "!" * 78,
+                "",
+            ]
+        ),
+        flush=True,
+    )
+
+
+def _format_autotune_probe_summary(capacity_rejections, probe_errors, best_outcome):
+    accepted_count = 1 if best_outcome is not None else 0
+    lines = [
+        "Autotune probe summary: "
+        f"{accepted_count} accepted, "
+        f"{len(capacity_rejections)} capacity rejection(s), "
+        f"{len(probe_errors)} probe error(s)."
+    ]
+    if not probe_errors:
+        return "\n".join(lines)
+    lines.append("")
+    lines.append("PROBE ERRORS (not VRAM limits - investigate these as code bugs):")
+    seen = []
+    for outcome in probe_errors:
+        if outcome.detail not in seen:
+            seen.append(outcome.detail)
+    for detail in seen:
+        occurrences = sum(1 for outcome in probe_errors if outcome.detail == detail)
+        suffix = f" (x{occurrences} candidate(s))" if occurrences > 1 else ""
+        lines.append(f"  - {detail}{suffix}")
+    lines.append("")
+    lines.append("The selected candidate is the fastest probe that completed. It is not proof")
+    lines.append("that the erroring candidates were too large for this GPU.")
+    return "\n".join(lines)
+
+
+def _warn_if_cached_probe_errors(cached_entry):
+    """Re-surface probe errors recorded when a cached candidate was chosen."""
+    details = cached_entry.get("probe_errors")
+    if not isinstance(details, list):
+        return
+    details = [detail for detail in details if isinstance(detail, str) and detail.strip()]
+    if not details:
+        return
+    recorded_count = cached_entry.get("probe_error_count")
+    total = recorded_count if isinstance(recorded_count, int) else len(details)
+    print(
+        "WARNING: this cached autotune candidate was recorded while "
+        f"{total} candidate probe(s) failed with non-capacity errors. "
+        "The candidate is the fastest probe that completed, not a hardware limit."
+    )
+    print("  Re-run with AUTORESEARCH_AUTOTUNE_REFRESH=1 after fixing the errors below.")
+    for detail in details:
+        print(f"  - {detail}")
+
+
 def _benchmark_train_candidate(runtime, tokenizer, vocab_size, train_batch_size, use_checkpointing):
     config = build_model_config(
         DEPTH,
@@ -1135,18 +1274,51 @@ def _benchmark_train_candidate(runtime, tokenizer, vocab_size, train_batch_size,
         peak_memory = torch.cuda.max_memory_allocated()
         peak_limit = runtime.gpu_total_memory_bytes * AUTOTUNE_MAX_MEMORY_FRACTION
         if peak_memory > peak_limit:
-            return None
+            return _TrainProbeOutcome(
+                PROBE_VRAM_LIMIT,
+                train_batch_size,
+                use_checkpointing,
+                peak_memory_bytes=peak_memory,
+                detail=(
+                    f"peak_vram_mb={peak_memory / 1024 / 1024:.1f} exceeds "
+                    f"{AUTOTUNE_MAX_MEMORY_FRACTION:.0%} of "
+                    f"{runtime.gpu_total_memory_bytes / 1024 / 1024:.1f} MB"
+                ),
+            )
         tokens_measured = measure_micro_steps * tokens_per_micro_step
         tok_per_sec = tokens_measured / max(measured_time, 1e-6)
-        return tok_per_sec, peak_memory
-    except torch.cuda.OutOfMemoryError:
-        return None
-    except RuntimeError as exc:
-        print(
-            "Autotune candidate rejected "
-            f"(batch_size={train_batch_size}, checkpointing={'on' if use_checkpointing else 'off'}): {exc}"
+        return _TrainProbeOutcome(
+            PROBE_ACCEPTED,
+            train_batch_size,
+            use_checkpointing,
+            tok_per_sec=tok_per_sec,
+            peak_memory_bytes=peak_memory,
         )
-        return None
+    except torch.cuda.OutOfMemoryError as exc:
+        return _TrainProbeOutcome(
+            PROBE_OUT_OF_MEMORY,
+            train_batch_size,
+            use_checkpointing,
+            detail=_format_probe_exception(exc),
+        )
+    except Exception as exc:
+        kind = _classify_probe_exception(exc)
+        detail = _format_probe_exception(exc)
+        if kind == PROBE_OUT_OF_MEMORY:
+            return _TrainProbeOutcome(
+                PROBE_OUT_OF_MEMORY,
+                train_batch_size,
+                use_checkpointing,
+                detail=detail,
+            )
+        outcome = _TrainProbeOutcome(
+            PROBE_ERROR,
+            train_batch_size,
+            use_checkpointing,
+            detail=detail,
+        )
+        _print_probe_error(outcome, traceback.format_exc())
+        return outcome
     finally:
         del x, y, train_loader, optimizer, model
         torch.cuda.empty_cache()
@@ -1178,49 +1350,67 @@ def _autotune_train_candidate(runtime, tokenizer, vocab_size, train_candidates):
                         "Using cached autotune candidate: "
                         f"batch_size={cached_batch_size}, checkpointing={'on' if cached_checkpointing else 'off'}."
                     )
+                    _warn_if_cached_probe_errors(cached)
                     return cached_candidate
 
     print("Running consumer GPU autotune in eager mode...")
-    best_candidate = None
-    best_tok_per_sec = -1.0
-    best_peak_memory = 0
+    best_outcome = None
+    capacity_rejections = []
+    probe_errors = []
     for train_batch_size, use_checkpointing in train_candidates:
         ckpt_label = "on" if use_checkpointing else "off"
         print(f"Autotune probe: train_batch_size={train_batch_size}, checkpointing={ckpt_label}")
-        result = _benchmark_train_candidate(
+        outcome = _benchmark_train_candidate(
             runtime=runtime,
             tokenizer=tokenizer,
             vocab_size=vocab_size,
             train_batch_size=train_batch_size,
             use_checkpointing=use_checkpointing,
         )
-        if result is None:
-            print("  rejected (OOM, runtime error, or >90% VRAM use)")
+        if outcome.is_accepted:
+            print(
+                f"  accepted: tok/sec={outcome.tok_per_sec:,.0f}, "
+                f"peak_vram_mb={outcome.peak_memory_bytes / 1024 / 1024:.1f}"
+            )
+            if best_outcome is None or outcome.tok_per_sec > best_outcome.tok_per_sec:
+                best_outcome = outcome
             continue
-        tok_per_sec, peak_memory = result
-        print(f"  accepted: tok/sec={tok_per_sec:,.0f}, peak_vram_mb={peak_memory / 1024 / 1024:.1f}")
-        if tok_per_sec > best_tok_per_sec:
-            best_tok_per_sec = tok_per_sec
-            best_candidate = (train_batch_size, use_checkpointing)
-            best_peak_memory = peak_memory
+        if outcome.is_error:
+            probe_errors.append(outcome)
+            print("  rejected (probe error - see the banner above and the summary below)")
+            continue
+        capacity_rejections.append(outcome)
+        reason = (
+            "out of memory"
+            if outcome.kind == PROBE_OUT_OF_MEMORY
+            else f"peak VRAM above {AUTOTUNE_MAX_MEMORY_FRACTION:.0%} of total"
+        )
+        print(f"  rejected (capacity: {reason})")
 
-    if best_candidate is None:
+    print(_format_autotune_probe_summary(capacity_rejections, probe_errors, best_outcome))
+
+    if best_outcome is None:
         print("Autotune could not find a viable candidate; using default fallback ordering.")
+        if probe_errors:
+            print("Autotune found no viable candidate because probes errored, not because of VRAM.")
         return None
 
     cache_entries[cache_key] = {
-        "train_batch_size": best_candidate[0],
-        "use_activation_checkpointing": best_candidate[1],
-        "tok_per_sec": round(best_tok_per_sec, 3),
-        "peak_memory_bytes": int(best_peak_memory),
+        "train_batch_size": best_outcome.train_batch_size,
+        "use_activation_checkpointing": best_outcome.use_checkpointing,
+        "tok_per_sec": round(best_outcome.tok_per_sec, 3),
+        "peak_memory_bytes": int(best_outcome.peak_memory_bytes),
+        "probe_error_count": len(probe_errors),
+        "probe_errors": sorted({outcome.detail for outcome in probe_errors}),
         "updated_unix": int(time.time()),
     }
     _save_autotune_entries(cache_path, cache_entries)
     print(
         "Autotune selected candidate: "
-        f"batch_size={best_candidate[0]}, checkpointing={'on' if best_candidate[1] else 'off'}."
+        f"batch_size={best_outcome.train_batch_size}, "
+        f"checkpointing={'on' if best_outcome.use_checkpointing else 'off'}."
     )
-    return best_candidate
+    return (best_outcome.train_batch_size, best_outcome.use_checkpointing)
 
 
 def _prioritize_autotuned_candidate(train_candidates, autotuned_candidate, prefer_small_batch=False):

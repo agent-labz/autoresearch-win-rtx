@@ -77,6 +77,13 @@ prepare.py      — constants, data prep + runtime utilities (do not modify)
 train.py        — model, optimizer, training loop (agent modifies this)
 program.md      — agent instructions
 pyproject.toml  — dependencies
+tests/          — platform/autotune regression tests (no GPU needed)
+```
+
+Run the platform tests with:
+
+```
+uv run python -m unittest discover -s tests -v
 ```
 
 ## Design choices
