@@ -33,7 +33,7 @@ import platform
 import shutil
 import tempfile
 import time
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, replace
 from pathlib import Path
 
 os.environ.setdefault("PYTORCH_ALLOC_CONF", "expandable_segments:True")
@@ -64,7 +64,6 @@ class RuntimeConfig:
     device_type: str
     amp_dtype: torch.dtype
     use_compile: bool
-    use_activation_checkpointing: bool
     attention_backend: str
     gpu_name: str
     gpu_vram_gb: float
@@ -73,6 +72,12 @@ class RuntimeConfig:
     gpu_total_memory_bytes: int
     tf32_enabled: bool
     gpu_profile: "GpuProfile"
+    # There is deliberately no `use_activation_checkpointing` here. It used to
+    # mirror gpu_profile.default_checkpointing exactly and nothing ever read
+    # it back, which is how AUTORESEARCH_FORCE_CHECKPOINTING became an escape
+    # hatch that printed a confirmation and changed nothing. The resolved
+    # decision lives in gpu_profile.checkpoint_modes, which the candidate
+    # builder, the autotune cache guard and build_model_config all read.
 
 
 @dataclass(frozen=True)
@@ -153,7 +158,33 @@ def _forced_checkpointing():
         return True
     if raw == "0":
         return False
-    return None
+    if raw is None or raw.strip() == "":
+        return None
+    # Every other value used to read as "unset", which is the worst failure
+    # mode an escape hatch can have: a typo trained at the profile default
+    # while the operator believed the override was live.
+    raise ValueError(
+        f"AUTORESEARCH_FORCE_CHECKPOINTING={raw!r} is not 0 or 1; unset it to let the "
+        f"VRAM tier choose, 1 forces activation checkpointing on, 0 forces it off"
+    )
+
+
+def _force_checkpointing_mode(gpu_profile, forced_checkpointing):
+    """The same profile, with its candidate modes collapsed to the forced one.
+
+    Narrowing the profile rather than the candidate list is what makes the
+    override authoritative instead of advisory. Every later stage reads
+    `gpu_profile.checkpoint_modes`, so the train candidate list, the autotune
+    cache guard and the model config all see the same one-mode world and
+    cannot disagree about which mode this run is allowed to use.
+    """
+    if gpu_profile.checkpoint_modes == (forced_checkpointing,):
+        return gpu_profile
+    return replace(
+        gpu_profile,
+        checkpoint_modes=(forced_checkpointing,),
+        default_checkpointing=forced_checkpointing,
+    )
 
 
 def _checkpoint_modes(default_checkpointing):
@@ -321,13 +352,18 @@ def detect_runtime():
     attention_backend = "sdpa"
     print("Using PyTorch SDPA attention backend.")
     forced_checkpointing = _forced_checkpointing()
-    if forced_checkpointing is None:
-        use_activation_checkpointing = gpu_profile.default_checkpointing
-    else:
-        use_activation_checkpointing = forced_checkpointing
+    if forced_checkpointing is not None:
+        gpu_profile = _force_checkpointing_mode(gpu_profile, forced_checkpointing)
         print(
             "Activation checkpointing forced by AUTORESEARCH_FORCE_CHECKPOINTING="
-            f"{'1' if forced_checkpointing else '0'}"
+            f"{'1' if forced_checkpointing else '0'}; candidate checkpointing modes "
+            f"narrowed to {gpu_profile.checkpoint_modes}"
+        )
+    else:
+        print(
+            "Activation checkpointing: not forced; offering modes "
+            f"{gpu_profile.checkpoint_modes}, defaulting to "
+            f"{'enabled' if gpu_profile.default_checkpointing else 'disabled'}"
         )
 
     return RuntimeConfig(
@@ -335,7 +371,6 @@ def detect_runtime():
         device_type=device.type,
         amp_dtype=amp_dtype,
         use_compile=use_compile,
-        use_activation_checkpointing=use_activation_checkpointing,
         attention_backend=attention_backend,
         gpu_name=gpu_name,
         gpu_vram_gb=gpu_vram_gb,
@@ -1072,10 +1107,14 @@ EVAL_BATCH_SIZE = 8
 EVAL_BUDGET_TOKENS = 8 * 524288
 
 
-def build_model_config(depth, vocab_size, runtime, use_activation_checkpointing=None, use_moe=False,
+def build_model_config(depth, vocab_size, runtime, use_activation_checkpointing, use_moe=False,
                        num_experts=8, num_shared_experts=1, num_experts_per_tok=2, expert_dim=2048):
-    if use_activation_checkpointing is None:
-        use_activation_checkpointing = runtime.use_activation_checkpointing
+    # `use_activation_checkpointing` is a required argument, not an optional one
+    # that falls back to the runtime. The old fallback read a RuntimeConfig
+    # field that no call site ever consulted, so it could not have caught a
+    # caller that forgot the override; making it required means the mode in the
+    # model config is always the mode the candidate loop chose, and a caller
+    # that has to think about it is a caller that cannot get it silently wrong.
     base_dim = depth * ASPECT_RATIO
     model_dim = ((base_dim + HEAD_DIM - 1) // HEAD_DIM) * HEAD_DIM
     num_heads = model_dim // HEAD_DIM
@@ -1115,11 +1154,12 @@ def _filter_train_batch_sizes(candidates):
 
 def _build_train_candidates(runtime):
     batch_sizes = _filter_train_batch_sizes(runtime.gpu_profile.train_batch_candidates)
+    # No env read here. `detect_runtime` is the only reader of
+    # AUTORESEARCH_FORCE_CHECKPOINTING and has already narrowed
+    # gpu_profile.checkpoint_modes, so this list is a pure function of the
+    # runtime the caller was handed. Reading the environment a second time is
+    # what let the override and the candidate list drift apart silently.
     checkpoint_modes = runtime.gpu_profile.checkpoint_modes
-    forced_checkpointing = _forced_checkpointing()
-    if forced_checkpointing is not None:
-        narrowed = tuple(m for m in checkpoint_modes if m is forced_checkpointing)
-        checkpoint_modes = narrowed or (forced_checkpointing,)
     candidates = []
     for checkpointing in checkpoint_modes:
         for batch_size in batch_sizes:
@@ -2096,6 +2136,16 @@ def main():
 
     print(f"Attention backend: {runtime.attention_backend}")
     print(f"torch.compile: {'enabled' if USE_COMPILE else 'disabled'}")
+    # The one line an operator reads when a run OOMs and they reach for
+    # AUTORESEARCH_FORCE_CHECKPOINTING. If the hatch fired, the mode list has
+    # one entry and this says so; if it did not, the two-entry list explains
+    # why the override is not what the run is doing.
+    offered_modes = sorted({use_checkpointing for _, use_checkpointing in train_candidates})
+    print(
+        "Activation checkpointing candidates: "
+        f"{['enabled' if m else 'disabled' for m in offered_modes]}"
+        + (" (forced)" if len(offered_modes) == 1 else "")
+    )
 
     result = None
     chosen_train_batch = None

@@ -18,13 +18,17 @@ What it pins down:
    survive the pessimistic case rather than the one this machine happens to hit.
 2. No supported consumer profile can force activation checkpointing: every one of
    them offers both modes, so the autotune measures rather than obeys a tier.
-3. `AUTORESEARCH_FORCE_CHECKPOINTING` actually narrows the candidate set, on
-   consumer and compatibility profiles alike.
+3. `AUTORESEARCH_FORCE_CHECKPOINTING` is parsed once, rejects anything that is
+   neither `0` nor `1` instead of reading as unset, narrows the profile's mode
+   set, and the narrowed mode is what reaches `GPTConfig`. The candidate set is
+   also a pure function of the runtime: changing the environment afterwards does
+   not move it, which is the property that keeps the single read honest.
 4. The autotune cache is on a version that the old candidate set cannot satisfy,
    so a warm v2 cache cannot pin the mis-tiered decision after the fix.
 5. Live hardware agrees with the matrix assumption.
 """
 
+import inspect
 import os
 import sys
 
@@ -99,7 +103,6 @@ def make_runtime(train, profile, total_bytes, vram_gb, cc, name):
         device_type="cuda",
         amp_dtype=torch.bfloat16,
         use_compile=False,
-        use_activation_checkpointing=profile.default_checkpointing,
         attention_backend="sdpa",
         gpu_name=name,
         gpu_vram_gb=vram_gb,
@@ -163,7 +166,29 @@ def main():
                 f"got {sorted(modes)}",
             )
 
-    section("3. AUTORESEARCH_FORCE_CHECKPOINTING narrows the candidate set")
+    section("3. AUTORESEARCH_FORCE_CHECKPOINTING is one read, and it reaches the model config")
+    for raw, expected in (("1", True), ("0", False), (None, None), ("", None), ("  ", None)):
+        os.environ.pop("AUTORESEARCH_FORCE_CHECKPOINTING", None)
+        if raw is not None:
+            os.environ["AUTORESEARCH_FORCE_CHECKPOINTING"] = raw
+        try:
+            got = train._forced_checkpointing()
+        finally:
+            os.environ.pop("AUTORESEARCH_FORCE_CHECKPOINTING", None)
+        check(f"parse {raw!r} -> {expected}", got is expected, f"got {got!r}")
+    os.environ["AUTORESEARCH_FORCE_CHECKPOINTING"] = "yes"
+    try:
+        train._forced_checkpointing()
+        check("a value that is neither 0 nor 1 raises instead of silently reading as unset", False)
+    except ValueError:
+        check("a value that is neither 0 nor 1 raises instead of silently reading as unset", True)
+    finally:
+        os.environ.pop("AUTORESEARCH_FORCE_CHECKPOINTING", None)
+
+    # The pre-fix code read the environment in _build_train_candidates as well
+    # as in detect_runtime, so these checks go through the same single reader
+    # detect_runtime uses. A candidate set that does not depend on the env here
+    # is the property that stops the two readers drifting apart again.
     for flag, expected_modes in (("1", {True}), ("0", {False})):
         for name, cc, nominal, expected_profile, _ in SKU_MATRIX:
             if expected_profile == "compatibility" and flag == "0" and nominal > 16:
@@ -171,10 +196,18 @@ def main():
             total_bytes = int(nominal * GIB)
             vram_gb = total_bytes / GIB
             profile = train._resolve_gpu_profile(name, cc, vram_gb, True)
-            runtime = make_runtime(train, profile, total_bytes, vram_gb, cc, name)
             os.environ["AUTORESEARCH_FORCE_CHECKPOINTING"] = flag
             try:
+                forced = train._forced_checkpointing()
+                narrowed = train._force_checkpointing_mode(profile, forced)
+                runtime = make_runtime(train, narrowed, total_bytes, vram_gb, cc, name)
                 candidates = train._build_train_candidates(runtime)
+                reached = {
+                    train.build_model_config(
+                        train.DEPTH, 8192, runtime, use_activation_checkpointing=mode
+                    ).use_activation_checkpointing
+                    for _, mode in candidates
+                }
             finally:
                 del os.environ["AUTORESEARCH_FORCE_CHECKPOINTING"]
             modes = {m for _, m in candidates}
@@ -183,8 +216,52 @@ def main():
                 modes == expected_modes and len(candidates) > 0,
                 f"got {sorted(modes)}",
             )
+            check(
+                f"force={flag} on {name} {nominal}GB reaches the model config as {sorted(reached)}",
+                reached == expected_modes,
+                f"got {sorted(reached)}",
+            )
     os.environ.pop("AUTORESEARCH_FORCE_CHECKPOINTING", None)
     check("unset flag leaves the profile's own mode set intact", train._forced_checkpointing() is None)
+
+    # The drift guard. Narrow the profile once, then change the environment
+    # under it: the candidate set must not move, because the runtime the caller
+    # holds is supposed to be the whole truth.
+    total_bytes = int(16 * GIB)
+    vram_gb = total_bytes / GIB
+    profile = train._resolve_gpu_profile("NVIDIA GeForce RTX 4060 Ti", ADA, vram_gb, True)
+    narrowed = train._force_checkpointing_mode(profile, False)
+    runtime = make_runtime(train, narrowed, total_bytes, vram_gb, ADA, "NVIDIA GeForce RTX 4060 Ti")
+    before = train._build_train_candidates(runtime)
+    os.environ["AUTORESEARCH_FORCE_CHECKPOINTING"] = "1"
+    try:
+        after = train._build_train_candidates(runtime)
+    finally:
+        del os.environ["AUTORESEARCH_FORCE_CHECKPOINTING"]
+    check(
+        "_build_train_candidates ignores a later change to the environment",
+        before == after and {m for _, m in after} == {False},
+        f"before={sorted({m for _, m in before})} after={sorted({m for _, m in after})}",
+    )
+    check(
+        "_force_checkpointing_mode leaves an already-single-mode profile alone",
+        train._force_checkpointing_mode(
+            train.GpuProfile("compat-x", False, True, (8, 4), (True,), True), True
+        ).checkpoint_modes
+        == (True,),
+    )
+    sig = inspect.signature(train.build_model_config)
+    param = sig.parameters["use_activation_checkpointing"]
+    check(
+        "build_model_config requires the checkpointing mode instead of falling back to a runtime field",
+        param.default is inspect.Parameter.empty,
+        f"default={param.default!r}",
+    )
+    check(
+        "RuntimeConfig no longer carries a dead use_activation_checkpointing field",
+        "use_activation_checkpointing" not in train.RuntimeConfig.__dataclass_fields__,
+        f"fields={list(train.RuntimeConfig.__dataclass_fields__)}",
+    )
 
     section("4. the warm autotune cache cannot pin the pre-fix decision")
     check("cache version bumped off v2", train.AUTOTUNE_CACHE_VERSION != "gpu-profile-v2", train.AUTOTUNE_CACHE_VERSION)
