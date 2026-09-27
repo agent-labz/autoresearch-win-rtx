@@ -411,6 +411,66 @@ INIT_GAMMA_REFERENCE = {
 }
 INIT_GAMMA_RTOL = 0.02
 
+# value_embeds is the one tensor whose init scale is *not* discarded, and it is
+# the only init knob left that is live.
+#
+# wte gets its scale thrown away twice over: `x = norm(wte(idx))` removes it on
+# the forward pass, and AdamW removes it from the update (|g| falls as
+# 1/init_scale, and the update divides the scale straight back out). So wte's
+# init scale reaches neither the forward pass nor the optimizer. value_embeds
+# gets neither treatment: v = c_v(x) + gate * ve is a plain sum with no norm on
+# it, so the table's own entry RMS is a direct multiplier on the value vector.
+#
+# At the shipped gamma 0.500 the table lands at entry RMS 0.0442 while
+# c_v(norm(x)) lands at ~1.0, so the lookup starts 22.6x weaker than the context
+# path it is added to. Two independently derived arguments say to start it
+# stronger: arXiv:2606.02780 reports the lookup and c_v(x) alone at identical
+# BPB, and eps = 1e-10 (AUT-34) prefers the larger gradient that larger entries
+# produce. Neither is a muP argument and neither is in the muP literature.
+#
+# Arm selection is by environment rather than by a code edit per run, because
+# the arms are one constant apart and the census below already prints the value
+# that was used:
+#
+#   AUTORESEARCH_VE_INIT_GAMMA=0.000   parity with c_v(x); std 1.0, what wte uses
+#   AUTORESEARCH_VE_INIT_GAMMA=0.250   midpoint, in case parity overshoots
+#   (unset)                            0.500, the shipped value
+#
+# Not claimed: that a larger ve is better. That needs a run, and the effect may
+# sit under the unmeasured val_bpb noise floor like the rest of the backlog.
+#
+# INIT_GAMMA_REFERENCE["value_embeds"] stays at 0.500 on purpose: both arms trip
+# the drift warning, and that warning is the "this init change was deliberate"
+# line in the run log. Re-baseline it when an arm is adopted, not when it is
+# proposed.
+VALUE_EMBED_INIT_GAMMA = 0.500
+
+
+def _ve_init_gamma():
+    """The value-embedding init gamma this run uses, and where it came from.
+
+    Read once per process so that init_weights, the census and the arm table
+    cannot disagree, and rejected loudly rather than silently falling back:
+    a typo'd arm that quietly trained at 0.500 would be the worst outcome,
+    because it would produce a run that looks fine and answers nothing.
+    """
+    raw = os.environ.get("AUTORESEARCH_VE_INIT_GAMMA")
+    if raw is None or raw.strip() == "":
+        return VALUE_EMBED_INIT_GAMMA, "default"
+    try:
+        gamma = float(raw)
+    except ValueError:
+        raise ValueError(
+            f"AUTORESEARCH_VE_INIT_GAMMA={raw!r} is not a number; expected a gamma in "
+            f"[0, 1] (0.000 = parity with c_v(x), 0.500 = the shipped value)"
+        ) from None
+    if not 0.0 <= gamma <= 1.0:
+        raise ValueError(
+            f"AUTORESEARCH_VE_INIT_GAMMA={raw!r} is outside [0, 1]; the arms under test "
+            f"are 0.000 and 0.250 and the shipped value is 0.500"
+        )
+    return gamma, "AUTORESEARCH_VE_INIT_GAMMA"
+
 
 def _entry_rms(tensor):
     """Root-mean-square of a parameter, accumulated in fp32 without casting the whole tensor.
@@ -512,6 +572,15 @@ def _assert_muon_init_precondition(model, muon_params):
                 f"{reference:.4f}. Intentional? Re-baseline INIT_GAMMA_REFERENCE."
             )
     print(f"  {zero_count} of {len(muon_params)} Muon tensors are zero-init (c_proj, ve_gate)")
+
+    # Which value-embedding arm produced this census. The gamma above is measured
+    # from the tensors, so it is already in the log; this records the *source*, so
+    # a run can be reproduced from its own log without knowing the shell it ran in.
+    ve_gamma, ve_source = _ve_init_gamma()
+    print(
+        f"  value_embeds arm: gamma {ve_gamma:.4f} (std {n_embd ** -ve_gamma:.4f}) "
+        f"from {ve_source}"
+    )
 
     if failures:
         raise RuntimeError(
@@ -667,8 +736,13 @@ class GPT(nn.Module):
             torch.nn.init.zeros_(block.mlp.c_proj.weight)
         self.resid_lambdas.fill_(1.0)
         self.x0_lambdas.fill_(0.1)
+        # Same form as the hidden matrices, with value_embeds' own gamma: the
+        # shipped 0.500 reproduces s exactly (3**0.5 * n_embd**-0.5), so this is
+        # a no-op at the default and a one-constant change per arm.
+        ve_gamma, _ = _ve_init_gamma()
+        ve_s = 3 ** 0.5 * n_embd ** -ve_gamma
         for ve in self.value_embeds.values():
-            torch.nn.init.uniform_(ve.weight, -s, s)
+            torch.nn.init.uniform_(ve.weight, -ve_s, ve_s)
         for block in self.transformer.h:
             if block.attn.ve_gate is not None:
                 torch.nn.init.zeros_(block.attn.ve_gate.weight)
