@@ -98,10 +98,14 @@ This fork's platform policy is explicit and tiered.
 - Desktop only: laptop GPUs are not officially supported due to wide power and thermal variance.
 - Floor policy: Turing desktop GPUs are supported at >=8 GB VRAM; Ampere/Ada/Blackwell desktop GPUs require >=10 GB VRAM.
 - `RTX 2060 6GB` remains out of matrix support due to VRAM floor.
+- VRAM tier boundaries are compared with a 0.25 GB reporting tolerance, because `props.total_memory` excludes a small NVIDIA-reserved region and so a card sold as N GB always reports slightly under N GiB (an RTX 4060 Ti 16 GB reports 15.9956 GiB). The tolerance is far below the 2 GB+ gap between adjacent retail VRAM sizes, so it corrects the boundary without promoting a card into a tier it cannot hold.
+- Tier boundaries select *which candidates are offered*; they do not force activation checkpointing. Every supported consumer profile offers both checkpointing modes and lets the autotune measure which one wins, so a mis-tiered card costs throughput headroom rather than correctness. `AUTORESEARCH_FORCE_CHECKPOINTING=0|1` narrows the candidate set to one mode if you need a hard override.
 - Runtime path is intentionally unified across platforms: PyTorch SDPA attention + eager optimizer steps.
 - Runtime adaptation is profile-driven: compute capability, BF16/TF32 support, OS, and VRAM tier determine candidate batch sizes and checkpointing strategy.
-- Supported consumer profiles run a short eager-mode autotune pass and cache the selected candidate per GPU/runtime fingerprint.
-- Autotune env controls: `AUTORESEARCH_DISABLE_AUTOTUNE=1` skips probing; `AUTORESEARCH_AUTOTUNE_REFRESH=1` refreshes the cached decision.
+- Supported consumer profiles run a short eager-mode autotune pass and cache the selected candidate per GPU/runtime fingerprint. The cache is versioned; bump `AUTOTUNE_CACHE_VERSION` in `train.py` when the candidate set or the resolver changes, or stale decisions will be accepted from cache.
+- An autotune probe measures device-batch throughput over a fixed 131,072-token window rather than simulating whole optimizer steps, so autotune wall clock does not scale with `TOTAL_BATCH_SIZE`. On an RTX 4060 Ti the full 8-candidate search costs about 107 s; the pre-fix 3-candidate search cost about 212 s.
+- Without an autotune result, supported consumer profiles fall back to smallest-batch-first. On Windows an oversized candidate can spill to shared system memory instead of raising OOM, so the unmeasured fallback must not lead with the largest batch.
+- Autotune env controls: `AUTORESEARCH_DISABLE_AUTOTUNE=1` skips probing; `AUTORESEARCH_AUTOTUNE_REFRESH=1` refreshes the cached decision; `AUTORESEARCH_SAVE_PRE_EVAL_CHECKPOINT=1` opts into writing the 169 MB `checkpoint_pre_eval.pt` debug artifact (off by default; nothing reads it).
 - Tested hardware in this repo remains RTX 3080 10 GB on Windows. Other listed SKUs are matrix-supported but may be less field-tested here.
 - Non-goals for this fork include FA3/H100-specialized paths, unofficial Triton-for-Windows stacks, AMD/ROCm, Apple Metal, and multi-GPU training.
 - Default dataset is `karpathy/tinystories_gpt4_clean` for consumer-GPU practicality.

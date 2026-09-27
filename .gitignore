@@ -18,3 +18,7 @@ AGENTS.md
 
 # Experimental code/artifacts
 dev/
+
+# Per-run artifacts (results.tsv is tracked on purpose)
+*.pt
+run.log
