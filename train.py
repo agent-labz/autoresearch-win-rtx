@@ -7,6 +7,7 @@ Usage: uv run train.py
 import argparse
 import gc
 import json
+import math
 import os
 import platform
 import time
@@ -360,6 +361,170 @@ def has_ve(layer_idx, n_layer):
     return layer_idx % 2 == (n_layer - 1) % 2
 
 
+# ---------------------------------------------------------------------------
+# Init-scale census and Muon's small-init precondition (AUT-37)
+# ---------------------------------------------------------------------------
+# Two literature lines disagree about where a matrix should be initialised, and
+# both state their case as a property of *the matrices*:
+#
+#   * arXiv:2601.13474 (Ma, Huang, Chi, Chen) proves Muon's convergence rate is
+#     independent of the condition number, and states that all guarantees
+#     "require small initialization". It verifies alpha = 0.1 and names
+#     robustness to a broader init range as future work.
+#   * arXiv:2606.17945 and arXiv:2608.30315 write std = d**-gamma as a *single*
+#     gamma shared by all matrices, and reason about gradient flow from it.
+#
+# Neither can notice us. init_weights sets four different scales and nothing
+# downstream can tell: no assert, no warning, no log line, and the run looks
+# completely normal. So the scales are measured here, once, from the tensors
+# themselves, and the two preconditions are asserted rather than assumed.
+#
+# What the tensors actually are at n_embd = 512 (see the census this prints):
+#
+#   wte           normal(0, 1.0)      gamma 0.000   AdamW
+#   hidden        uniform(-s, s)      gamma 0.500   Muon   (s/sqrt(3) = d**-0.5)
+#   c_proj, gate  zeros               gamma inf     Muon
+#   lm_head       normal(0, 0.001)    gamma 1.107   AdamW
+#   value_embeds  uniform(-s, s)      gamma 0.500   AdamW
+#
+# The 22.6x embedding/hidden gap is real and is not Muon's problem: Muon is
+# given only the hidden matrices, and those are already uniform at one gamma.
+# The ceiling below is what stops "uniform at one gamma" from being satisfied
+# degenerately - every matrix at std 1.0 would pass a uniformity check and
+# break every guarantee in 2601.13474.
+MUON_MAX_INIT_RMS = 0.1
+MUON_INIT_UNIFORMITY_RTOL = 0.05
+
+# Expected init scale per role, as gamma in the std = d**-gamma convention.
+# Informational, not enforced: changing an init scale is a legitimate
+# experiment, and the census this guard prints is the record of the new value.
+# Re-baseline here when one is made, so drift stops being silent.
+INIT_GAMMA_REFERENCE = {
+    "wte": 0.0,
+    "value_embeds": 0.5,
+    "lm_head": 1.107,
+    "muon": 0.5,
+    "muon_zero": math.inf,
+}
+INIT_GAMMA_RTOL = 0.02
+
+
+def _entry_rms(tensor):
+    """Root-mean-square of a parameter, accumulated in fp32 without casting the whole tensor.
+
+    init_weights runs inside the timed region and the autotune path is VRAM-bound, so
+    this deliberately avoids materialising an fp32 copy of a 2048x8192 table.
+    """
+    return float(
+        torch.linalg.vector_norm(tensor.detach(), dtype=torch.float32)
+        / (tensor.numel() ** 0.5)
+    )
+
+
+def _gamma_of(entry_rms, n_embd):
+    """gamma in the std = d**-gamma; math.inf for an exactly-zero tensor."""
+    if entry_rms <= 0.0:
+        return math.inf
+    return -math.log(entry_rms) / math.log(n_embd)
+
+
+def _assert_muon_init_precondition(model, muon_params):
+    """Assert the two init properties Muon is entitled to assume, and print the census.
+
+    Called from setup_optimizer, where the Muon/AdamW partition is built, so the
+    set of tensors checked is the set Muon actually owns and cannot drift away
+    from it. Raises RuntimeError naming the offending tensor; a legitimate init
+    experiment is a deliberate edit to the constants above, not a way to make
+    this stop complaining.
+    """
+    n_embd = model.config.n_embd
+    failures = []
+
+    # (1) The two zero-initialised residual branches are what make the network an
+    # identity map at step 0, and therefore what makes WARMUP_RATIO = 0 safe.
+    # Checked per block by name rather than as a set of tensors, so that changing
+    # which layers carry value embeddings does not turn this into a false alarm.
+    for block in model.transformer.h:
+        for sub in (block.attn, block.mlp):
+            max_abs = float(sub.c_proj.weight.detach().abs().max())
+            if max_abs != 0.0:
+                failures.append(
+                    f"{type(sub).__name__}.c_proj is not zero-init (max abs {max_abs:.6g}); "
+                    "the residual branches must start as the identity map or "
+                    "WARMUP_RATIO = 0 is unsafe"
+                )
+
+    # (2) and (3): one shared gamma across every non-degenerate Muon matrix, and
+    # that gamma inside the range the guarantees were verified over.
+    muon_rms = {id(p): _entry_rms(p) for p in muon_params}
+    nonzero = sorted(v for v in muon_rms.values() if v > 0.0)
+    zero_count = len(muon_rms) - len(nonzero)
+    if not nonzero:
+        failures.append("every Muon tensor is zero-init; there is nothing to precondition")
+    else:
+        median = nonzero[len(nonzero) // 2]
+        shared_gamma = _gamma_of(median, n_embd)
+        if median > MUON_MAX_INIT_RMS:
+            failures.append(
+                f"entry RMS {median:.6g} exceeds MUON_MAX_INIT_RMS {MUON_MAX_INIT_RMS} "
+                f"(gamma {shared_gamma:.4f}); 2601.13474 verifies its guarantees only "
+                f"at alpha=0.1, so this run would be outside its theory"
+            )
+        for p in muon_params:
+            rms = muon_rms[id(p)]
+            if rms > 0.0 and abs(rms - median) > MUON_INIT_UNIFORMITY_RTOL * median:
+                failures.append(
+                    f"{_muon_param_name(model, p)} entry RMS {rms:.6g} differs from the "
+                    f"other Muon tensors' {median:.6g} (gamma "
+                    f"{_gamma_of(rms, n_embd):.4f} vs {shared_gamma:.4f}); the small-init "
+                    f"papers assume one gamma across all matrices and do not cover this"
+                )
+
+    # Census. Printed on every run so that any future init change is a diff in
+    # the log rather than something nobody can find afterwards.
+    census = {
+        "wte": _entry_rms(model.transformer.wte.weight),
+        "value_embeds": max(
+            (_entry_rms(ve.weight) for ve in model.value_embeds.values()), default=0.0
+        ),
+        "lm_head": _entry_rms(model.lm_head.weight),
+        "muon": nonzero[len(nonzero) // 2] if nonzero else 0.0,
+        "muon_zero": 0.0,
+    }
+    owner = {
+        "wte": "adamw",
+        "value_embeds": "adamw",
+        "lm_head": "adamw",
+        "muon": "muon",
+        "muon_zero": "muon",
+    }
+    print(f"Init scale census at n_embd={n_embd} (std = d**-gamma, {len(muon_params)} Muon tensors):")
+    for role, rms in census.items():
+        gamma = _gamma_of(rms, n_embd)
+        reference = INIT_GAMMA_REFERENCE[role]
+        print(f"  {role:14s} owner={owner[role]:5s} entry_rms={rms:.6g}  gamma={gamma:.4f}")
+        if gamma != reference and abs(gamma - reference) > INIT_GAMMA_RTOL:
+            print(
+                f"  WARNING: init scale for {role} is gamma {gamma:.4f}, not the recorded "
+                f"{reference:.4f}. Intentional? Re-baseline INIT_GAMMA_REFERENCE."
+            )
+    print(f"  {zero_count} of {len(muon_params)} Muon tensors are zero-init (c_proj, ve_gate)")
+
+    if failures:
+        raise RuntimeError(
+            "Muon init precondition violated (AUT-37):\n  - "
+            + "\n  - ".join(failures)
+            + "\n  The scales above are printed so the offending one is identifiable."
+        )
+
+
+def _muon_param_name(model, param):
+    for name, tensor in model.named_parameters():
+        if tensor is param:
+            return name
+    return "<unnamed Muon tensor>"
+
+
 def apply_rotary_emb(x, cos, sin):
     assert x.ndim == 4
     d = x.shape[3] // 2
@@ -621,6 +786,8 @@ class GPT(nn.Module):
         optimizer = MuonAdamW(param_groups)
         for group in optimizer.param_groups:
             group["initial_lr"] = group["lr"]
+        muon_params = [p for group in param_groups if group["kind"] == "muon" for p in group["params"]]
+        _assert_muon_init_precondition(self, muon_params)
         return optimizer
 
     def forward(self, idx, targets=None, reduction="mean"):
