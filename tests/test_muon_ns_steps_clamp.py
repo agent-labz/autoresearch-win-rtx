@@ -177,7 +177,14 @@ class TestSetupOptimizerWiring(unittest.TestCase):
 
     @classmethod
     def setUpClass(cls):
+        # init_weights() before setup_optimizer(), because that is the order the shipped
+        # path uses. Building a bare GPT and calling setup_optimizer() on it leaves the
+        # residual c_proj matrices at their default init rather than zero, which
+        # _assert_muon_init_precondition (AUT-37) correctly rejects on branches that
+        # carry it. This file is meant to be portable onto those branches, and a test
+        # that errors there for a reason unrelated to ns_steps reads as a broken guard.
         cls.model = train.GPT(train.GPTConfig())
+        cls.model.init_weights()
 
     def test_default_setup_optimizer_builds_and_every_muon_group_is_honourable(self):
         optimizer = self.model.setup_optimizer()
