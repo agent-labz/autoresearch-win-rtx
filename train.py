@@ -577,7 +577,8 @@ class GPT(nn.Module):
         }
 
     def setup_optimizer(self, unembedding_lr=0.004, embedding_lr=0.2, matrix_lr=0.02,
-                        weight_decay=0.0, adam_betas=(0.8, 0.95), scalar_lr=0.5):
+                        weight_decay=0.0, adam_betas=(0.8, 0.95), scalar_lr=0.5,
+                        ns_steps=5):
         model_dim = self.config.n_embd
         matrix_params = list(self.transformer.h.parameters())
         value_embeds_params = list(self.value_embeds.parameters())
@@ -603,6 +604,9 @@ class GPT(nn.Module):
             dict(kind="adamw", params=x0_params, lr=scalar_lr, betas=(0.96, 0.95), eps=1e-10, weight_decay=0.0),
         ]
         muon_group_chunk = 8
+        # AUT-80: validated here so an un-honourable ns_steps names itself in run.log at
+        # setup, next to the group it was going to change, rather than as a mid-run raise.
+        assert_ns_steps_available(ns_steps)
         for shape in sorted({p.shape for p in matrix_params}):
             group_params = [p for p in matrix_params if p.shape == shape]
             for ci in range(0, len(group_params), muon_group_chunk):
@@ -613,7 +617,7 @@ class GPT(nn.Module):
                         params=chunk,
                         lr=matrix_lr,
                         momentum=0.95,
-                        ns_steps=5,
+                        ns_steps=ns_steps,
                         beta2=0.95,
                         weight_decay=weight_decay,
                     )
@@ -668,6 +672,28 @@ polar_express_coeffs = [
     (2.3465413258596377, -1.7097828382687081, 0.42323551169305323),
 ]
 
+# AUT-80: the Polar Express schedule is a fixed coefficient list, so the number of
+# Newton-Schulz iterations is not a free knob -- it is capped by len(polar_express_coeffs).
+# Slicing the list silently runs len(coeffs) iterations for any larger request, with no
+# assert, warning or log line, so bumping ns_steps past the cap produces a bit-identical
+# optimizer step that a results file can honestly only record as "no change". The extra
+# triples have to come from the Polar Express coeffs_list
+# (github.com/NoahAmsel/PolarExpress), not from a larger ns_steps.
+POLAR_EXPRESS_MAX_STEPS = len(polar_express_coeffs)
+
+
+def assert_ns_steps_available(ns_steps):
+    """Reject an ns_steps the coefficient list cannot honour, before it is a no-op."""
+    if ns_steps > POLAR_EXPRESS_MAX_STEPS:
+        raise ValueError(
+            f"ns_steps={ns_steps} but polar_express_coeffs has only "
+            f"{POLAR_EXPRESS_MAX_STEPS} triples; the iteration would silently run "
+            f"{POLAR_EXPRESS_MAX_STEPS} times and produce an identical update. Add the "
+            f"coefficients first (PolarExpress coeffs_list)."
+        )
+    if ns_steps < 1:
+        raise ValueError(f"ns_steps={ns_steps} would skip orthogonalization entirely")
+
 
 def adamw_step_fused(p, grad, exp_avg, exp_avg_sq, step_t, lr_t, beta1_t, beta2_t, eps_t, wd_t):
     p.mul_(1 - lr_t * wd_t)
@@ -689,6 +715,7 @@ def muon_step_fused(stacked_grads, stacked_params, momentum_buffer, second_momen
     g = stacked_grads.lerp_(momentum_buffer, momentum)
     X = g.to(dtype=MUON_COMPUTE_DTYPE)
     X = X / (X.norm(dim=(-2, -1), keepdim=True) * 1.02 + 1e-6)
+    assert_ns_steps_available(ns_steps)
     if g.size(-2) > g.size(-1):
         for a, b, c in polar_express_coeffs[:ns_steps]:
             A = X.mT @ X
